@@ -13,15 +13,24 @@
 #   GCS_BACKUP_BUCKET   — GCS bucket name (no gs:// prefix), e.g. "whatsapp-bridge-sessions-504457548316"
 #   DEFAULT_SESSION_ID  — session to restore, e.g. "smba"
 #   DB_DIR              — local path, e.g. "/data/whatsapp"  (default: /data/whatsapp)
+#   BACKUP_INTERVAL     — seconds between periodic hot backups (default: 120)
 #
 # The Cloud Run service account must have roles/storage.objectAdmin on the bucket.
 # No extra tools needed — uses the GCS JSON REST API + the metadata server token.
+#
+# Session-persistence guarantees:
+#   1. Startup:  restore .db + .db-wal + .db-shm from GCS (SQLite auto-applies WAL on open).
+#   2. Shutdown: stop bridge first (lets SQLite checkpoint WAL), then upload all three files.
+#   3. Periodic: hot-backup every BACKUP_INTERVAL seconds so a SIGKILL loses at most
+#      that many seconds of session/message data instead of everything since last restart.
 
 set -e
 
 _DB_DIR="${DB_DIR:-/data/whatsapp}"
 _SESSION="${DEFAULT_SESSION_ID:-}"
 _BUCKET="${GCS_BACKUP_BUCKET:-}"
+_BACKUP_INTERVAL="${BACKUP_INTERVAL:-120}"
+_BACKUP_PID=""
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -56,6 +65,25 @@ _gcs_upload() {
         > /dev/null 2>&1
 }
 
+# _gcs_upload_multi fetches a single token and uploads multiple files in one shot.
+# Usage: _gcs_upload_multi bucket object1 src1 [object2 src2 ...]
+_gcs_upload_multi() {
+    local bucket="$1"; shift
+    local token
+    token=$(_gcs_token)
+    while [ $# -ge 2 ]; do
+        local object="$1" src="$2"; shift 2
+        [ -f "$src" ] || continue
+        curl -sf \
+            -X POST \
+            -H "Authorization: Bearer ${token}" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary "@${src}" \
+            "https://storage.googleapis.com/upload/storage/v1/b/${bucket}/o?uploadType=media&name=${object}" \
+            > /dev/null 2>&1 || echo "[entrypoint] WARNING: upload failed for ${object}"
+    done
+}
+
 # ── startup restore ───────────────────────────────────────────────────────────
 
 if [ -n "$_BUCKET" ] && [ -n "$_SESSION" ]; then
@@ -77,20 +105,73 @@ else
     echo "[entrypoint] GCS_BACKUP_BUCKET or DEFAULT_SESSION_ID not set — skipping GCS restore"
 fi
 
-# ── graceful shutdown: back up DB before the container exits ─────────────────
+# ── upload helper: back up main DB + WAL + SHM to GCS ────────────────────────
+
+_upload_db() {
+    if [ -z "$_BUCKET" ] || [ -z "$_SESSION" ]; then
+        return 0
+    fi
+    local db="${_DB_DIR}/${_SESSION}.db"
+    [ -f "$db" ] || return 1
+
+    local wal="${db}-wal" shm="${db}-shm"
+
+    # Upload main DB plus any WAL/SHM files with a single metadata-server token.
+    # SQLite uses .db + .db-wal together to reconstruct the full committed state
+    # on the next open, so they must be kept in sync.
+    _gcs_upload_multi "$_BUCKET" \
+        "${_SESSION}.db"     "$db" \
+        "${_SESSION}.db-wal" "$wal" \
+        "${_SESSION}.db-shm" "$shm"
+
+    echo "[entrypoint] Uploaded ${_SESSION}.db ($(wc -c < "$db") bytes)"
+    return 0
+}
+
+# ── periodic hot backup (safety net against SIGKILL / OOM kill) ──────────────
+# Runs in the background and uploads every BACKUP_INTERVAL seconds while the
+# bridge is alive.  In WAL mode the .db + .db-wal pair is always consistent, so
+# copying both files gives a safe point-in-time snapshot even with a live DB.
+
+_periodic_backup() {
+    while true; do
+        sleep "${_BACKUP_INTERVAL}"
+        # Exit loop if bridge process no longer exists.
+        kill -0 "${_PID}" 2>/dev/null || break
+        if [ -n "$_BUCKET" ] && [ -n "$_SESSION" ] && [ -f "${_DB_DIR}/${_SESSION}.db" ]; then
+            echo "[entrypoint] Periodic backup of ${_SESSION}.db"
+            _upload_db || true
+        fi
+    done
+}
+
+# ── graceful shutdown: stop bridge first, THEN back up ───────────────────────
+#
+# BUG FIXED: the previous version uploaded the DB *before* killing the bridge.
+# While the bridge was still running, SQLite's WAL file held uncommitted pages
+# that had not yet been flushed into the main .db file.  The backup therefore
+# captured a stale snapshot, so after the next restart the session appeared
+# incomplete or missing entirely.
+#
+# Correct order:
+#   1. Send SIGTERM to bridge → bridge closes its SQLite connection cleanly,
+#      which triggers an automatic WAL checkpoint and flushes all data into
+#      the main .db file.
+#   2. Wait for bridge process to fully exit.
+#   3. Upload the now-complete .db (plus WAL/SHM as belt-and-suspenders).
 
 _backup_and_exit() {
-    echo "[entrypoint] SIGTERM received — backing up session DB to GCS before exit"
-    if [ -n "$_BUCKET" ] && [ -n "$_SESSION" ] && [ -f "${_DB_DIR}/${_SESSION}.db" ]; then
-        if _gcs_upload "$_BUCKET" "${_SESSION}.db" "${_DB_DIR}/${_SESSION}.db"; then
-            echo "[entrypoint] Backup of ${_SESSION}.db complete"
-        else
-            echo "[entrypoint] WARNING: GCS backup failed — session will need re-pairing after next start"
-        fi
-    fi
-    # Forward SIGTERM to the bridge process so it shuts down cleanly.
-    kill -TERM "$_PID" 2>/dev/null || true
-    wait "$_PID" 2>/dev/null || true
+    echo "[entrypoint] SIGTERM received — stopping bridge before GCS backup"
+
+    # Kill the periodic-backup helper so it doesn't race with the final upload.
+    [ -n "${_BACKUP_PID}" ] && kill "${_BACKUP_PID}" 2>/dev/null || true
+
+    # Stop the bridge and wait for it to flush/checkpoint the WAL.
+    kill -TERM "${_PID}" 2>/dev/null || true
+    wait "${_PID}" 2>/dev/null || true
+    echo "[entrypoint] Bridge stopped — uploading DB to GCS"
+
+    _upload_db
 }
 
 trap _backup_and_exit TERM INT
@@ -100,6 +181,19 @@ trap _backup_and_exit TERM INT
 echo "[entrypoint] Starting whatsapp-bridge (session=${_SESSION:-unset} db_dir=${_DB_DIR})"
 /app/whatsapp-bridge "$@" &
 _PID=$!
+
+# Start periodic hot-backup in the background (safety net against SIGKILL).
+if [ -n "$_BUCKET" ] && [ -n "$_SESSION" ]; then
+    _periodic_backup &
+    _BACKUP_PID=$!
+fi
+
 wait "$_PID"
+
+# Bridge exited on its own (clean restart/OOM).  Kill the periodic-backup helper
+# and do a final upload so Cloud Run's next revision starts with a fresh DB.
+[ -n "${_BACKUP_PID}" ] && kill "${_BACKUP_PID}" 2>/dev/null || true
+echo "[entrypoint] Bridge exited — performing final GCS backup"
+_upload_db || true
 
  

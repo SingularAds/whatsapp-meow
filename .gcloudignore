@@ -1,0 +1,22 @@
+.gcloudignore
+.git
+.gitignore
+
+# Pre-built binary — Cloud Build compiles from source; don't upload the local binary
+whatsapp-bridge
+
+# Local data / test artifacts
+data/
+*.db
+*.sqlite
+*.db-wal
+*.db-shm
+
+# Go test cache and tool binaries
+tools/inspect_db
+
+# Editor / OS noise
+.env
+*.swp
+*.swo
+__pycache__/

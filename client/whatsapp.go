@@ -705,7 +705,7 @@ func (m *Manager) connectWithQR(s *session) {
 		case "login":
 			slog.Info("QR login successful, waiting for full connection", "session", s.id)
 			s.setStatus(StatusConnecting)
-			
+
 			// Wait up to 20 seconds for the connection to be fully authenticated.
 			// This ensures the session credentials are persisted and ready for use
 			// before we return control. If the connection doesn't fully establish,
@@ -1084,7 +1084,6 @@ func (m *Manager) handleCallEnd(sessionID, callID, reason, detail string) {
 
 func (m *Manager) handleIncoming(s *session, evt *events.Message) {
 	info := evt.Info
-	msg := evt.Message
 
 	// ── Verbose entry log — always at INFO so production traces are clear ──────
 	// Shows the key fields for every incoming event so the exact processing
@@ -1148,141 +1147,145 @@ func (m *Manager) handleIncoming(s *session, evt *events.Message) {
 		return
 	}
 
-	// Determine message type and body.
-	msgType, body, mediaURL, mimeType := classifyMessage(s, m, evt)
-	if msgType == "" {
-		m.tracker.TrackMessageTypeFiltered(s.id, info.Chat.User, "unsupported_type")
-		return // unsupported/ignored message type
-	}
-
-	// Sender's full JID used as the reply-to address in the webhook payload.
-	// info.Sender is an AD-JID (Agent-Device JID) for 1:1 messages — e.g.
-	// "35317885218956:74@lid" or "917696794756:12@s.whatsapp.net".
-	// WhatsApp's /send/message endpoint only accepts user-level JIDs (no device
-	// part), so we strip the device component with ToNonAD() before forwarding.
-	// Result: "35317885218956@lid" or "917696794756@s.whatsapp.net".
-	from := info.Sender.ToNonAD().String()
-
-	// chat_id: the raw user-part of the chat JID (digits for normal phones, or
-	// the LID user string for privacy-protected contacts).
-	chatID := info.Chat.User
-
-	// ── LID → Phone Number resolution ────────────────────────────────────────
-	// WhatsApp privacy mode causes messages to arrive from @lid JIDs instead
-	// of the sender's real phone JID.  Resolve using WhatsMeow's LID map which
-	// is populated by WhatsApp contact-sync data.  If resolved:
-	//   • senderPN  = full phone JID e.g. "917696794756@s.whatsapp.net"
-	//   • chatID    = real phone digits (sent as chat_id to backend for DB ops)
-	// If NOT resolved (new contact not yet in cache), we fall through with the
-	// LID digits as chatID — the backend will use LID as a stable customer key
-	// until a sync populates the mapping.
-	senderPN := ""
-	if info.Sender.Server == types.HiddenUserServer {
-		ctx := context.Background()
-		if pnJID, err := s.container.LIDMap.GetPNForLID(ctx, info.Sender); err == nil && !pnJID.IsEmpty() {
-			senderPN = pnJID.String()
-			// Use real phone digits as chat_id so backend DB operations bind
-			// to the customer's stable phone number rather than the LID.
-			chatID = pnJID.User
-			slog.Info("[bridge] resolved LID to PN",
-				"session", s.id,
-				"lid", from,
-				"pn", senderPN,
-			)
-		} else {
-			slog.Debug("[bridge] LID not yet in cache — using LID digits as customer key",
-				"session", s.id,
-				"lid", from,
-			)
+	// Dispatch the heavy work (LID server-roundtrip, media download, webhook)
+	// to a goroutine so whatsmeow's event loop is not blocked.  The guards
+	// above are all cheap (no I/O) and must run synchronously so filtered
+	// messages are accounted before we return to the loop.
+	go func() {
+		// Determine message type and body.
+		msgType, body, mediaURL, mimeType := classifyMessage(s, m, evt)
+		if msgType == "" {
+			m.tracker.TrackMessageTypeFiltered(s.id, info.Chat.User, "unsupported_type")
+			return // unsupported/ignored message type
 		}
-	}
 
-	// Business phone number this session is registered to (our own WhatsApp number).
-	ownPhone := ""
-	if s.client.Store.ID != nil {
-		ownPhone = s.client.Store.ID.User // raw digits
-	}
+		// Sender's full JID used as the reply-to address in the webhook payload.
+		// info.Sender is an AD-JID (Agent-Device JID) for 1:1 messages — e.g.
+		// "35317885218956:74@lid" or "917696794756:12@s.whatsapp.net".
+		// WhatsApp's /send/message endpoint only accepts user-level JIDs (no device
+		// part), so we strip the device component with ToNonAD() before forwarding.
+		// Result: "35317885218956@lid" or "917696794756@s.whatsapp.net".
+		from := info.Sender.ToNonAD().String()
 
-	// Track that this message passed all guards and reached the AI pipeline.
-	m.tracker.TrackMessageReceived(s.id, chatID, msgType, info.PushName)
+		// chat_id: the raw user-part of the chat JID (digits for normal phones, or
+		// the LID user string for privacy-protected contacts).
+		chatID := info.Chat.User
 
-	// -- Intent classification --------------------------------------------------
-	// The global onboarding session (smba) handles ALL first-contact customer
-	// messages regardless of content — the Python onboarding service needs to
-	// see every message to drive the onboarding state machine.  Applying the
-	// intent filter here would silently drop messages that don't match a
-	// business keyword (e.g. "I run a restaurant in Lisbon") and break the flow.
-	if m.defaultSessionID != "" && s.id == m.defaultSessionID {
-		slog.Info("[bridge] onboarding session — bypassing intent filter, forwarding to Python",
-			"session", s.id, "chat", chatID)
-		m.tracker.TrackBusinessIntent(s.id, chatID)
-	} else {
-		// Use the StateStore cache where available; fall back to heuristic
-		// classification from the message text.  Media messages with no text body
-		// are treated as business by default (customers routinely send voice notes
-		// and images on a business number).
-		var msgIntent intent.Intent
-		fromCache := false
-		if cachedIntent, ok := m.intentStore.Get(chatID); ok {
-			msgIntent = cachedIntent
-			fromCache = true
-		} else if body != "" {
-			msgIntent = intent.Classify(body)
-		} else {
-			// No textual signal - fail-open as business (media message).
-			msgIntent = intent.IntentBusiness
+		// ── LID → Phone Number resolution ────────────────────────────────────────
+		// WhatsApp privacy mode causes messages to arrive from @lid JIDs instead
+		// of the sender's real phone JID.  Resolve using WhatsMeow's LID map which
+		// is populated by WhatsApp contact-sync data.  If resolved:
+		//   • senderPN  = full phone JID e.g. "917696794756@s.whatsapp.net"
+		//   • chatID    = real phone digits (sent as chat_id to backend for DB ops)
+		// If NOT resolved (new contact not yet in cache), we fall through with the
+		// LID digits as chatID — the backend will use LID as a stable customer key
+		// until a sync populates the mapping.
+		senderPN := ""
+		if info.Sender.Server == types.HiddenUserServer {
+			ctx := context.Background()
+			if pnJID, err := s.container.LIDMap.GetPNForLID(ctx, info.Sender); err == nil && !pnJID.IsEmpty() {
+				senderPN = pnJID.String()
+				// Use real phone digits as chat_id so backend DB operations bind
+				// to the customer's stable phone number rather than the LID.
+				chatID = pnJID.User
+				slog.Info("[bridge] resolved LID to PN",
+					"session", s.id,
+					"lid", from,
+					"pn", senderPN,
+				)
+			} else {
+				slog.Debug("[bridge] LID not yet in cache — using LID digits as customer key",
+					"session", s.id,
+					"lid", from,
+				)
+			}
 		}
-		m.tracker.TrackIntentClassified(s.id, chatID, msgIntent.String(), fromCache)
 
-		switch msgIntent {
-		case intent.IntentBusiness:
-			// Refresh cache so the TTL resets on continued business conversation.
-			m.intentStore.Set(chatID, intent.IntentBusiness)
+		// Business phone number this session is registered to (our own WhatsApp number).
+		ownPhone := ""
+		if s.client.Store.ID != nil {
+			ownPhone = s.client.Store.ID.User // raw digits
+		}
+
+		// Track that this message passed all guards and reached the AI pipeline.
+		m.tracker.TrackMessageReceived(s.id, chatID, msgType, info.PushName)
+
+		// -- Intent classification --------------------------------------------------
+		// The global onboarding session (smba) handles ALL first-contact customer
+		// messages regardless of content — the Python onboarding service needs to
+		// see every message to drive the onboarding state machine.  Applying the
+		// intent filter here would silently drop messages that don't match a
+		// business keyword (e.g. "I run a restaurant in Lisbon") and break the flow.
+		if m.defaultSessionID != "" && s.id == m.defaultSessionID {
+			slog.Info("[bridge] onboarding session — bypassing intent filter, forwarding to Python",
+				"session", s.id, "chat", chatID)
 			m.tracker.TrackBusinessIntent(s.id, chatID)
-			slog.Info("[bridge] intent: business - forwarding to AI",
-				"session", s.id, "chat", chatID, "from_cache", fromCache)
+		} else {
+			// Use the StateStore cache where available; fall back to heuristic
+			// classification from the message text.  Media messages with no text body
+			// are treated as business by default (customers routinely send voice notes
+			// and images on a business number).
+			var msgIntent intent.Intent
+			fromCache := false
+			if cachedIntent, ok := m.intentStore.Get(chatID); ok {
+				msgIntent = cachedIntent
+				fromCache = true
+			} else if body != "" {
+				msgIntent = intent.Classify(body)
+			} else {
+				// No textual signal - fail-open as business (media message).
+				msgIntent = intent.IntentBusiness
+			}
+			m.tracker.TrackIntentClassified(s.id, chatID, msgIntent.String(), fromCache)
 
-		case intent.IntentPersonal:
-			m.intentStore.Set(chatID, intent.IntentPersonal)
-			m.tracker.TrackPersonalIntent(s.id, chatID)
-			m.tracker.TrackAIReplySkipped(s.id, chatID, info.ID, "personal_intent")
-			slog.Info("[bridge] intent: personal - skipping AI reply",
-				"session", s.id, "chat", chatID, "msg_id", info.ID, "from_cache", fromCache)
-			return
+			switch msgIntent {
+			case intent.IntentBusiness:
+				// Refresh cache so the TTL resets on continued business conversation.
+				m.intentStore.Set(chatID, intent.IntentBusiness)
+				m.tracker.TrackBusinessIntent(s.id, chatID)
+				slog.Info("[bridge] intent: business - forwarding to AI",
+					"session", s.id, "chat", chatID, "from_cache", fromCache)
 
-		default: // IntentUnclear - do not cache; re-evaluate on the next message.
-			m.tracker.TrackUnclearIntent(s.id, chatID)
-			m.tracker.TrackAIReplySkipped(s.id, chatID, info.ID, "unclear_intent")
-			slog.Info("[bridge] intent: unclear - skipping AI reply",
-				"session", s.id, "chat", chatID, "msg_id", info.ID)
-			return
+			case intent.IntentPersonal:
+				m.intentStore.Set(chatID, intent.IntentPersonal)
+				m.tracker.TrackPersonalIntent(s.id, chatID)
+				m.tracker.TrackAIReplySkipped(s.id, chatID, info.ID, "personal_intent")
+				slog.Info("[bridge] intent: personal - skipping AI reply",
+					"session", s.id, "chat", chatID, "msg_id", info.ID, "from_cache", fromCache)
+				return
+
+			default: // IntentUnclear - do not cache; re-evaluate on the next message.
+				m.tracker.TrackUnclearIntent(s.id, chatID)
+				m.tracker.TrackAIReplySkipped(s.id, chatID, info.ID, "unclear_intent")
+				slog.Info("[bridge] intent: unclear - skipping AI reply",
+					"session", s.id, "chat", chatID, "msg_id", info.ID)
+				return
+			}
 		}
-	}
 
-	payload := webhook.Event{
-		Event:    "message",
-		DeviceID: s.id,
-		Phone:    ownPhone,
-		Payload: webhook.MessagePayload{
-			ChatID:      chatID,
-			From:        from,
-			SenderPN:    senderPN,
-			PushName:    info.PushName,
-			Body:        body,
-			MessageID:   info.ID,
-			Timestamp:   info.Timestamp.Unix(),
-			IsFromMe:    info.IsFromMe,
-			IsGroup:     info.IsGroup,
-			MessageType: msgType,
-			MediaURL:    mediaURL,
-			MimeType:    mimeType,
-		},
-	}
+		payload := webhook.Event{
+			Event:    "message",
+			DeviceID: s.id,
+			Phone:    ownPhone,
+			Payload: webhook.MessagePayload{
+				ChatID:      chatID,
+				From:        from,
+				SenderPN:    senderPN,
+				PushName:    info.PushName,
+				Body:        body,
+				MessageID:   info.ID,
+				Timestamp:   info.Timestamp.Unix(),
+				IsFromMe:    info.IsFromMe,
+				IsGroup:     info.IsGroup,
+				MessageType: msgType,
+				MediaURL:    mediaURL,
+				MimeType:    mimeType,
+			},
+		}
 
-	_ = msg // suppress unused warning; msg is used inside classifyMessage
-
-	go m.sender.Send(payload)
-	m.tracker.TrackAIReplySent(s.id, chatID, info.ID, msgType)
+		m.sender.Send(payload)
+		m.tracker.TrackAIReplySent(s.id, chatID, info.ID, msgType)
+	}()
 }
 
 func classifyMessage(s *session, m *Manager, evt *events.Message) (msgType, body, mediaURL, mimeType string) {

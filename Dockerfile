@@ -14,7 +14,9 @@ FROM alpine:3.20
 
 # curl is needed by entrypoint.sh to talk to the GCS JSON API and the
 # metadata server for the Cloud Run service-account token.
-RUN apk add --no-cache ca-certificates curl ffmpeg tzdata \
+# dos2unix converts Windows CRLF line endings to LF so the shell script runs
+# correctly when built on a Windows host.
+RUN apk add --no-cache ca-certificates curl dos2unix ffmpeg tzdata \
     && addgroup -S app \
     && adduser -S -G app app
 
@@ -22,7 +24,7 @@ WORKDIR /app
 
 COPY --from=builder /out/whatsapp-bridge /app/whatsapp-bridge
 COPY entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
+RUN dos2unix /app/entrypoint.sh && chmod +x /app/entrypoint.sh
 
 ENV PORT=3020 \
     DB_DIR=/data/whatsapp \
