@@ -1,0 +1,12 @@
+.git
+.gitignore
+.env
+data/
+*.db
+*.db-wal
+*.db-shm
+*.exe
+whatsapp-bridge
+main.exe
+README.md.bak
+tools/
