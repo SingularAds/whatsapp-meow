@@ -706,20 +706,28 @@ func (m *Manager) connectWithQR(s *session) {
 			slog.Info("QR login successful, waiting for full connection", "session", s.id)
 			s.setStatus(StatusConnecting)
 
-			// Wait up to 20 seconds for the connection to be fully authenticated.
-			// This ensures the session credentials are persisted and ready for use
-			// before we return control. If the connection doesn't fully establish,
-			// we'll log the warning and continue; the reconnect logic will handle it.
-			if s.client.WaitForConnection(20 * time.Second) {
+			// Wait up to 30 seconds for the connection to be fully authenticated.
+			// Increased from 20s to handle slower networks.
+			if s.client.WaitForConnection(30 * time.Second) {
 				slog.Info("QR connection fully established", "session", s.id)
 				s.setStatus(StatusConnected)
 			} else {
-				slog.Warn("QR connection authenticated but full connection setup timed out",
+				// Do NOT mark as connected on timeout — the handshake is incomplete.
+				// connectWithRetry will re-establish the connection.
+				slog.Warn("QR connection timed out after login — triggering reconnect",
 					"session", s.id)
-				s.setStatus(StatusConnected) // Still mark as connected; message handling will work
+				s.setStatus(StatusDisconnected)
+				go m.connectWithRetry(s)
 			}
 		case "timeout":
+			// QR code expired without being scanned.  Clear the stale payload
+			// immediately so that polling callers (GET /api/qr-current) never
+			// return an expired code that WhatsApp will reject with
+			// "we could not connect, try again later".
 			slog.Warn("QR code timed out", "session", s.id)
+			s.qrMu.Lock()
+			s.qrPayload = ""
+			s.qrMu.Unlock()
 			s.setStatus(StatusDisconnected)
 		default:
 			slog.Debug("QR event", "session", s.id, "event", evt.Event)
@@ -727,6 +735,24 @@ func (m *Manager) connectWithQR(s *session) {
 	}
 	slog.Info("QR channel closed", "session", s.id)
 	cancel()
+
+	// Clear stale QR state so no expired payload is ever served after this
+	// goroutine exits.  Reset qrReadyCh to nil so the next GetQRPayload call
+	// correctly starts a fresh QR goroutine instead of instantly returning
+	// the (now-gone) old channel.
+	s.qrMu.Lock()
+	s.qrPayload = ""
+	s.qrReadyCh = nil
+	s.qrMu.Unlock()
+
+	// If the session is still unpaired the QR timed out without being scanned.
+	// Auto-restart the QR flow after a brief pause so a fresh code is always
+	// available without requiring manual intervention from the Python backend.
+	if !s.paired() {
+		slog.Info("QR session ended without pairing — scheduling QR restart in 2s", "session", s.id)
+		time.Sleep(2 * time.Second)
+		go m.connectWithQR(s)
+	}
 }
 
 // GetQRPayload ensures a QR session is running for sessionID and blocks until
@@ -820,7 +846,7 @@ func (m *Manager) connectWithRetry(s *session) {
 		s.setStatus(StatusConnecting)
 		err := s.client.Connect()
 		if err == nil || err == whatsmeow.ErrAlreadyConnected {
-			if s.client.WaitForConnection(20 * time.Second) {
+			if s.client.WaitForConnection(30 * time.Second) {
 				s.setStatus(StatusConnected)
 				return
 			}
