@@ -520,7 +520,7 @@ func (m *Manager) GeneratePairCode(ctx context.Context, sessionID, phoneNumber s
 	}
 	slog.Debug("GeneratePairCode: Connect completed successfully", "session", sessionID)
 
-	slog.Info("GeneratePairCode: waiting for QR/pairing ready event (timeout 10s)",
+	slog.Info("GeneratePairCode: waiting for QR/pairing ready event (timeout 20s)",
 		"session", sessionID)
 	select {
 	case readyErr := <-readyCh:
@@ -543,9 +543,9 @@ func (m *Manager) GeneratePairCode(ctx context.Context, sessionID, phoneNumber s
 		slog.Error("GeneratePairCode: context cancelled before pairing ready",
 			"session", sessionID, "error", ctx.Err())
 		return "", ctx.Err()
-	case <-time.After(10 * time.Second):
+	case <-time.After(20 * time.Second):
 		s.setStatus(StatusNeedsPairing)
-		slog.Error("GeneratePairCode: timeout waiting for pairing ready event (10s exceeded)",
+		slog.Error("GeneratePairCode: timeout waiting for pairing ready event (20s exceeded)",
 			"session", sessionID)
 		return "", errPairingReadyTimeout
 	}
