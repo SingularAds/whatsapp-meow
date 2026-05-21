@@ -673,6 +673,14 @@ func (m *Manager) connectWithQR(s *session) {
 	qrChan, err := s.client.GetQRChannel(ctx)
 	if err != nil {
 		slog.Warn("cannot open QR channel", "session", s.id, "error", err)
+		// Close readyCh first to unblock any GetQRPayload callers that have already
+		// picked up this channel reference — otherwise they block for the full
+		// 45-second timeout on a channel that will never receive a QR code.
+		// Then nil out qrReadyCh so the next GetQRPayload call starts a fresh goroutine.
+		close(readyCh)
+		s.qrMu.Lock()
+		s.qrReadyCh = nil
+		s.qrMu.Unlock()
 		cancel()
 		return
 	}
@@ -681,6 +689,11 @@ func (m *Manager) connectWithQR(s *session) {
 	if err := s.client.Connect(); err != nil && err != whatsmeow.ErrAlreadyConnected {
 		slog.Error("QR connect failed", "session", s.id, "error", err)
 		s.setStatus(StatusDisconnected)
+		// Same as above: unblock callers immediately and reset for the next attempt.
+		close(readyCh)
+		s.qrMu.Lock()
+		s.qrReadyCh = nil
+		s.qrMu.Unlock()
 		cancel()
 		return
 	}
@@ -778,14 +791,29 @@ func (m *Manager) GetQRPayload(ctx context.Context, sessionID string, timeout ti
 	s.qrMu.RUnlock()
 
 	if readyCh == nil {
-		// EnsureSession should have started connectWithQR for an unpaired
-		// session, but guard defensively.
-		go m.connectWithQR(s)
-		// Give the goroutine a moment to set qrReadyCh before we read it.
-		time.Sleep(50 * time.Millisecond)
-		s.qrMu.RLock()
-		readyCh = s.qrReadyCh
-		s.qrMu.RUnlock()
+		// EnsureSession starts connectWithQR in a goroutine; give it up to 1 s to
+		// set qrReadyCh before we assume no goroutine is running.  A single 50 ms
+		// sleep is too short on production (Go scheduler may not have run the
+		// goroutine yet), which caused a second connectWithQR to be launched in
+		// parallel — the two goroutines would race to overwrite qrReadyCh and one
+		// would inevitably leave it pointing at an abandoned channel → timeout.
+		deadline := time.Now().Add(1 * time.Second)
+		for readyCh == nil && time.Now().Before(deadline) {
+			time.Sleep(50 * time.Millisecond)
+			s.qrMu.RLock()
+			readyCh = s.qrReadyCh
+			s.qrMu.RUnlock()
+		}
+
+		if readyCh == nil {
+			// EnsureSession may have started connectWithRetry (existing paired
+			// session that just disconnected).  Launch a fresh QR goroutine.
+			go m.connectWithQR(s)
+			time.Sleep(200 * time.Millisecond)
+			s.qrMu.RLock()
+			readyCh = s.qrReadyCh
+			s.qrMu.RUnlock()
+		}
 	}
 
 	if readyCh == nil {
