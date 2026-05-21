@@ -32,37 +32,46 @@ _BUCKET="${GCS_BACKUP_BUCKET:-}"
 _BACKUP_INTERVAL="${BACKUP_INTERVAL:-120}"
 _BACKUP_PID=""
 
+# Network hardening for GCS calls (seconds).
+_CURL_CONNECT_TIMEOUT="${CURL_CONNECT_TIMEOUT:-5}"
+_CURL_MAX_TIME="${CURL_MAX_TIME:-30}"
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 _gcs_token() {
-    curl -sf \
+    local payload token
+    payload=$(curl -sS \
+        --connect-timeout "${_CURL_CONNECT_TIMEOUT}" \
+        --max-time "${_CURL_MAX_TIME}" \
         -H "Metadata-Flavor: Google" \
         "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" \
-    | sed 's/.*"access_token":"\([^"]*\)".*/\1/'
+    ) || {
+        echo "[entrypoint] ERROR: unable to fetch metadata token"
+        return 1
+    }
+
+    token=$(printf '%s' "$payload" | sed -n 's/.*"access_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    if [ -z "$token" ]; then
+        echo "[entrypoint] ERROR: metadata token payload did not contain access_token"
+        return 1
+    fi
+
+    printf '%s' "$token"
 }
 
 _gcs_download() {
     local bucket="$1" object="$2" dest="$3"
     local token
-    token=$(_gcs_token)
+    token=$(_gcs_token) || return 1
     # URL-encode slashes in the object name (%2F) if needed — not needed here.
-    curl -sf \
+    curl -sS \
+        --connect-timeout "${_CURL_CONNECT_TIMEOUT}" \
+        --max-time "${_CURL_MAX_TIME}" \
+        --retry 3 \
+        --retry-delay 1 \
         -H "Authorization: Bearer ${token}" \
         "https://storage.googleapis.com/storage/v1/b/${bucket}/o/${object}?alt=media" \
         -o "${dest}" 2>/dev/null
-}
-
-_gcs_upload() {
-    local bucket="$1" object="$2" src="$3"
-    local token
-    token=$(_gcs_token)
-    curl -sf \
-        -X POST \
-        -H "Authorization: Bearer ${token}" \
-        -H "Content-Type: application/octet-stream" \
-        --data-binary "@${src}" \
-        "https://storage.googleapis.com/upload/storage/v1/b/${bucket}/o?uploadType=media&name=${object}" \
-        > /dev/null 2>&1
 }
 
 # _gcs_upload_multi fetches a single token and uploads multiple files in one shot.
@@ -70,17 +79,40 @@ _gcs_upload() {
 _gcs_upload_multi() {
     local bucket="$1"; shift
     local token
-    token=$(_gcs_token)
+    token=$(_gcs_token) || return 1
     while [ $# -ge 2 ]; do
         local object="$1" src="$2"; shift 2
         [ -f "$src" ] || continue
-        curl -sf \
+
+        local tmp status
+        tmp="$(mktemp)"
+        status=$(curl -sS \
+            --connect-timeout "${_CURL_CONNECT_TIMEOUT}" \
+            --max-time "${_CURL_MAX_TIME}" \
+            --retry 3 \
+            --retry-delay 1 \
+            -w "%{http_code}" \
+            -o "$tmp" \
             -X POST \
             -H "Authorization: Bearer ${token}" \
             -H "Content-Type: application/octet-stream" \
             --data-binary "@${src}" \
             "https://storage.googleapis.com/upload/storage/v1/b/${bucket}/o?uploadType=media&name=${object}" \
-            > /dev/null 2>&1 || echo "[entrypoint] WARNING: upload failed for ${object}"
+        ) || status="000"
+
+        case "$status" in
+            ''|*[!0-9]*) status="000" ;;
+        esac
+
+        if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
+            echo "[entrypoint] WARNING: upload failed for ${object} (http=${status})"
+            # Print a compact server response to aid debugging (permission, quota, etc).
+            head -c 300 "$tmp" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g' | sed 's/^/[entrypoint] ERROR: /'
+            rm -f "$tmp"
+            continue
+        fi
+
+        rm -f "$tmp"
     done
 }
 

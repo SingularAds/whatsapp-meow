@@ -42,7 +42,7 @@ func QRPayloadHandler(mgr *client.Manager) gin.HandlerFunc {
 			"timeout", timeout,
 		)
 
-	payload, err := mgr.GetQRPayload(c.Request.Context(), req.SessionID, timeout)
+		payload, err := mgr.GetQRPayload(c.Request.Context(), req.SessionID, timeout)
 		if err != nil {
 			var pairingErr *client.PairingStateError
 			if errors.As(err, &pairingErr) {
@@ -62,11 +62,13 @@ func QRPayloadHandler(mgr *client.Manager) gin.HandlerFunc {
 				})
 				return
 			}
-		slog.Error("[QR_HANDLER_ERROR] GetQRPayload failed, returning 500 Internal Server Error",
-			"session", req.SessionID,
-			"requested_timeout", timeout.String(),
-			"error", err.Error(),
-			"error_type", fmt.Sprintf("%T", err),
+			slog.Error("[QR_HANDLER_ERROR] GetQRPayload failed, returning 500 Internal Server Error",
+				"session", req.SessionID,
+				"requested_timeout", timeout.String(),
+				"error", err.Error(),
+				"error_type", fmt.Sprintf("%T", err),
+			)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
 
