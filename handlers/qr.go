@@ -67,6 +67,11 @@ func QRPayloadHandler(mgr *client.Manager) gin.HandlerFunc {
 			"requested_timeout", timeout.String(),
 			"error", err.Error(),
 			"error_type", fmt.Sprintf("%T", err),
+		)
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error":     "failed to get QR payload: " + err.Error(),
+				"sessionId": req.SessionID,
+			})
 			return
 		}
 
