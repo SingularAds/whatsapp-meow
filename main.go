@@ -97,7 +97,7 @@ func main() {
 	// All other routes require Basic-Auth.
 	auth := middleware.BasicAuth(cfg.BridgeUsername, cfg.BridgePassword)
 
-	router.POST("/send/message", auth, handlers.SendMessageHandler(mgr))
+	router.POST("/send/message", auth, handlers.SendMessageHandler(mgr, time.Duration(cfg.WhatsAppOpTimeoutSeconds)*time.Second))
 	router.GET("/media/*filename", auth, handlers.MediaHandler(mediaDir))
 	router.GET("/api/sessions", auth, handlers.SessionsListHandler(mgr))
 	router.GET("/api/sessions/:session_id", auth, handlers.SessionHandler(mgr))

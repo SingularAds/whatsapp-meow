@@ -14,6 +14,7 @@ type Config struct {
 	WebhookURL      string
 	WebhookSecret   string
 	LogLevel        string
+	WhatsAppOpTimeoutSeconds int
 	MediaTTLSeconds int
 	// PublicURL is the externally reachable base URL of this bridge,
 	// used to construct inbound media_url values sent in webhooks.
@@ -42,6 +43,7 @@ func Load() Config {
 		WebhookURL:       getEnv("WEBHOOK_URL", "http://localhost:8000"),
 		WebhookSecret:    getEnv("WEBHOOK_SECRET", ""),
 		LogLevel:         getEnv("LOG_LEVEL", "INFO"),
+		WhatsAppOpTimeoutSeconds: getEnvInt("WHATSAPP_OP_TIMEOUT_SECONDS", 120),
 		MediaTTLSeconds:  getEnvInt("MEDIA_TTL_SECONDS", 3600),
 		PublicURL:        getEnv("PUBLIC_URL", "http://localhost:"+port),
 		DefaultSessionID: getEnv("DEFAULT_SESSION_ID", "smba"),

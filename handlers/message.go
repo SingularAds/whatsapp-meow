@@ -38,7 +38,7 @@ type imageField struct {
 
 // SendMessageHandler handles POST /send/message for BOTH text and audio.
 // Dispatches based on the "type" field: absent/empty → text, "audio" → audio.
-func SendMessageHandler(mgr *client.Manager) gin.HandlerFunc {
+func SendMessageHandler(mgr *client.Manager, opTimeout time.Duration) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		deviceID := c.GetHeader("X-Device-Id")
 		if deviceID == "" {
@@ -82,12 +82,12 @@ func SendMessageHandler(mgr *client.Manager) gin.HandlerFunc {
 		}
 
 		if req.Type == "audio" {
-			handleAudio(c, wac, jid.String(), req)
+			handleAudio(c, wac, jid.String(), req, opTimeout)
 			return
 		}
 
 		if req.Type == "image" {
-			handleImage(c, wac, jid.String(), req)
+			handleImage(c, wac, jid.String(), req, opTimeout)
 			return
 		}
 
@@ -96,14 +96,16 @@ func SendMessageHandler(mgr *client.Manager) gin.HandlerFunc {
 			return
 		}
 
-		handleText(c, wac, jid.String(), req.Message)
+		handleText(c, wac, jid.String(), req.Message, opTimeout)
 	}
 }
 
-func handleText(c *gin.Context, wac *whatsmeow.Client, jidStr, text string) {
+func handleText(c *gin.Context, wac *whatsmeow.Client, jidStr, text string, opTimeout time.Duration) {
 	jid, _ := client.ParsePhone(jidStr)
 	msg := client.BuildTextMessage(text)
-	resp, err := wac.SendMessage(context.Background(), jid, msg)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), opTimeout)
+	defer cancel()
+	resp, err := wac.SendMessage(ctx, jid, msg)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -111,7 +113,7 @@ func handleText(c *gin.Context, wac *whatsmeow.Client, jidStr, text string) {
 	c.JSON(http.StatusOK, gin.H{"status": "sent", "message_id": resp.ID})
 }
 
-func handleAudio(c *gin.Context, wac *whatsmeow.Client, jidStr string, req sendMessageRequest) {
+func handleAudio(c *gin.Context, wac *whatsmeow.Client, jidStr string, req sendMessageRequest, opTimeout time.Duration) {
 	if req.Audio == nil || req.Audio.Data == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "audio.data is required"})
 		return
@@ -131,7 +133,9 @@ func handleAudio(c *gin.Context, wac *whatsmeow.Client, jidStr string, req sendM
 	}
 
 	// Upload to WhatsApp CDN.
-	uploaded, err := wac.Upload(context.Background(), audioBytes, whatsmeow.MediaAudio)
+	uploadCtx, uploadCancel := context.WithTimeout(c.Request.Context(), opTimeout)
+	defer uploadCancel()
+	uploaded, err := wac.Upload(uploadCtx, audioBytes, whatsmeow.MediaAudio)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "upload failed: " + err.Error()})
 		return
@@ -161,7 +165,9 @@ func handleAudio(c *gin.Context, wac *whatsmeow.Client, jidStr string, req sendM
 	}
 
 	jid, _ := client.ParsePhone(jidStr)
-	resp, err := wac.SendMessage(context.Background(), jid, audioMsg)
+	sendCtx, sendCancel := context.WithTimeout(c.Request.Context(), opTimeout)
+	defer sendCancel()
+	resp, err := wac.SendMessage(sendCtx, jid, audioMsg)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -171,7 +177,7 @@ func handleAudio(c *gin.Context, wac *whatsmeow.Client, jidStr string, req sendM
 
 // handleImage sends a PNG/JPEG image as a WhatsApp ImageMessage.
 // The image bytes must be provided as a base64-encoded string in req.Image.Data.
-func handleImage(c *gin.Context, wac *whatsmeow.Client, jidStr string, req sendMessageRequest) {
+func handleImage(c *gin.Context, wac *whatsmeow.Client, jidStr string, req sendMessageRequest, opTimeout time.Duration) {
 	if req.Image == nil || req.Image.Data == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "image.data is required for type=image"})
 		return
@@ -184,7 +190,9 @@ func handleImage(c *gin.Context, wac *whatsmeow.Client, jidStr string, req sendM
 	}
 
 	// Upload to the WhatsApp CDN.
-	uploaded, err := wac.Upload(context.Background(), imgBytes, whatsmeow.MediaImage)
+	uploadCtx, uploadCancel := context.WithTimeout(c.Request.Context(), opTimeout)
+	defer uploadCancel()
+	uploaded, err := wac.Upload(uploadCtx, imgBytes, whatsmeow.MediaImage)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "image upload failed: " + err.Error()})
 		return
@@ -212,7 +220,9 @@ func handleImage(c *gin.Context, wac *whatsmeow.Client, jidStr string, req sendM
 	}
 
 	jid, _ := client.ParsePhone(jidStr)
-	resp, err := wac.SendMessage(context.Background(), jid, imageMsg)
+	sendCtx, sendCancel := context.WithTimeout(c.Request.Context(), opTimeout)
+	defer sendCancel()
+	resp, err := wac.SendMessage(sendCtx, jid, imageMsg)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
