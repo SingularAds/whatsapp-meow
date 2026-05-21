@@ -51,14 +51,6 @@ const (
 
 var errPairingReadyTimeout = errors.New("timed out waiting for pairing-ready websocket state")
 
-// min returns the minimum of two integers (helper for string truncation in logs).
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 // PairingStateError means the caller asked to generate a pair code for a session
 // that already has persisted linked-device credentials and must reconnect instead.
 type PairingStateError struct {
@@ -256,24 +248,16 @@ func (m *Manager) EnsureSession(ctx context.Context, sessionID string) (*session
 	defer m.mu.Unlock()
 
 	if s, ok := m.sessions[sessionID]; ok {
-		slog.Debug("[QR_DEBUG] EnsureSession: session already exists", "session", sessionID, "status", s.getStatus())
 		return s, nil
 	}
 
-	slog.Info("[QR_DEBUG] EnsureSession: creating new session", "session", sessionID)
 	container, err := store.NewContainer(sessionID, m.dbDir)
 	if err != nil {
-		slog.Error("[QR_ERROR] EnsureSession: Failed to create store container",
-			"session", sessionID,
-			"error", err)
 		return nil, fmt.Errorf("store: %w", err)
 	}
 
 	device, err := container.GetFirstDevice(context.Background())
 	if err != nil {
-		slog.Error("[QR_ERROR] EnsureSession: Failed to get device from container",
-			"session", sessionID,
-			"error", err)
 		return nil, fmt.Errorf("get device: %w", err)
 	}
 
@@ -294,13 +278,9 @@ func (m *Manager) EnsureSession(ctx context.Context, sessionID string) (*session
 
 	if wac.Store.ID == nil {
 		// New device – print QR code to terminal so startup is usable immediately.
-		slog.Info("[QR_DEBUG] EnsureSession: Session is unpaired, starting QR flow", "session", sessionID)
 		go m.connectWithQR(s)
 	} else {
 		// Existing session – reconnect.
-		slog.Info("[QR_DEBUG] EnsureSession: Session is paired, starting reconnect",
-			"session", sessionID,
-			"phone", s.phone())
 		go m.connectWithRetry(s)
 	}
 
@@ -676,7 +656,6 @@ func (m *Manager) LogoutSession(ctx context.Context, sessionID string) error {
 // ──────────────────────────────────────────────────────────────────────────────
 
 func (m *Manager) connectWithQR(s *session) {
-	slog.Info("[QR_DEBUG] Starting QR connection flow", "session", s.id)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Create a fresh readyCh so that GetQRPayload callers can block until the
@@ -691,13 +670,9 @@ func (m *Manager) connectWithQR(s *session) {
 	s.qrReadyCh = readyCh
 	s.qrMu.Unlock()
 
-	slog.Debug("[QR_DEBUG] Attempting to open QR channel", "session", s.id)
 	qrChan, err := s.client.GetQRChannel(ctx)
 	if err != nil {
-		slog.Error("[QR_ERROR] Failed to open QR channel", 
-			"session", s.id, 
-			"error", err,
-			"error_type", fmt.Sprintf("%T", err))
+		slog.Warn("cannot open QR channel — scheduling retry in 3s", "session", s.id, "error", err)
 		// Close readyCh first to unblock any GetQRPayload callers that have already
 		// picked up this channel reference — otherwise they block for the full
 		// 45-second timeout on a channel that will never receive a QR code.
@@ -707,16 +682,19 @@ func (m *Manager) connectWithQR(s *session) {
 		s.qrReadyCh = nil
 		s.qrMu.Unlock()
 		cancel()
+		// Schedule a retry so the QR flow recovers automatically on production
+		// (GetQRChannel can fail if the whatsmeow client is in a transient state).
+		if !s.paired() {
+			slog.Info("connectWithQR: GetQRChannel failed — retrying in 3s", "session", s.id)
+			time.Sleep(3 * time.Second)
+			go m.connectWithQR(s)
+		}
 		return
 	}
 
 	s.setStatus(StatusConnecting)
-	slog.Debug("[QR_DEBUG] Calling client.Connect()", "session", s.id)
 	if err := s.client.Connect(); err != nil && err != whatsmeow.ErrAlreadyConnected {
-		slog.Error("[QR_ERROR] Client.Connect() failed", 
-			"session", s.id, 
-			"error", err,
-			"error_type", fmt.Sprintf("%T", err))
+		slog.Error("QR connect failed", "session", s.id, "error", err)
 		s.setStatus(StatusDisconnected)
 		// Same as above: unblock callers immediately and reset for the next attempt.
 		close(readyCh)
@@ -729,18 +707,9 @@ func (m *Manager) connectWithQR(s *session) {
 
 	firstCode := true
 	for evt := range qrChan {
-		slog.Debug("[QR_DEBUG] Received QR event", "session", s.id, "event", evt.Event)
 		switch evt.Event {
 		case "code":
 			// Store the latest payload so polling callers can retrieve it.
-			if evt.Code == "" {
-				slog.Error("[QR_ERROR] Received empty QR code", "session", s.id)
-			} else {
-				slog.Info("[QR_DEBUG] New QR code generated", 
-					"session", s.id, 
-					"code_length", len(evt.Code),
-					"code_prefix", evt.Code[:min(10, len(evt.Code))])
-			}
 			s.qrMu.Lock()
 			s.qrPayload = evt.Code
 			s.qrMu.Unlock()
@@ -748,26 +717,24 @@ func (m *Manager) connectWithQR(s *session) {
 			// Close readyCh once (first code) to unblock GetQRPayload waiters.
 			if firstCode {
 				firstCode = false
-				slog.Info("[QR_DEBUG] First QR code ready, unblocking waiters", "session", s.id)
 				close(readyCh)
 			}
 
 			fmt.Printf("\n[session: %s] Scan this QR code in WhatsApp → Linked Devices:\n", s.id)
 			qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 		case "login":
-			slog.Info("[QR_DEBUG] Login event received from WhatsApp", "session", s.id)
+			slog.Info("QR login successful, waiting for full connection", "session", s.id)
 			s.setStatus(StatusConnecting)
 
 			// Wait up to 30 seconds for the connection to be fully authenticated.
 			// Increased from 20s to handle slower networks.
-			slog.Debug("[QR_DEBUG] Waiting for connection to be fully established (30s max)", "session", s.id)
 			if s.client.WaitForConnection(30 * time.Second) {
-				slog.Info("[QR_SUCCESS] QR connection fully established", "session", s.id)
+				slog.Info("QR connection fully established", "session", s.id)
 				s.setStatus(StatusConnected)
 			} else {
 				// Do NOT mark as connected on timeout — the handshake is incomplete.
 				// connectWithRetry will re-establish the connection.
-				slog.Error("[QR_ERROR] WaitForConnection timed out after login event — triggering reconnect",
+				slog.Warn("QR connection timed out after login — triggering reconnect",
 					"session", s.id)
 				s.setStatus(StatusDisconnected)
 				go m.connectWithRetry(s)
@@ -777,16 +744,16 @@ func (m *Manager) connectWithQR(s *session) {
 			// immediately so that polling callers (GET /api/qr-current) never
 			// return an expired code that WhatsApp will reject with
 			// "we could not connect, try again later".
-			slog.Warn("[QR_TIMEOUT] QR code expired without being scanned", "session", s.id)
+			slog.Warn("QR code timed out", "session", s.id)
 			s.qrMu.Lock()
 			s.qrPayload = ""
 			s.qrMu.Unlock()
 			s.setStatus(StatusDisconnected)
 		default:
-			slog.Debug("[QR_DEBUG] Unknown QR event received", "session", s.id, "event", evt.Event)
+			slog.Debug("QR event", "session", s.id, "event", evt.Event)
 		}
 	}
-	slog.Warn("[QR_DEBUG] QR channel closed (loop exited)", "session", s.id)
+	slog.Info("QR channel closed", "session", s.id)
 	cancel()
 
 	// Clear stale QR state so no expired payload is ever served after this
@@ -802,11 +769,9 @@ func (m *Manager) connectWithQR(s *session) {
 	// Auto-restart the QR flow after a brief pause so a fresh code is always
 	// available without requiring manual intervention from the Python backend.
 	if !s.paired() {
-		slog.Info("[QR_DEBUG] QR session ended without pairing — scheduling QR restart in 2s", "session", s.id)
+		slog.Info("QR session ended without pairing — scheduling QR restart in 2s", "session", s.id)
 		time.Sleep(2 * time.Second)
 		go m.connectWithQR(s)
-	} else {
-		slog.Info("[QR_DEBUG] Session is paired, not restarting QR flow", "session", s.id)
 	}
 }
 
@@ -817,21 +782,13 @@ func (m *Manager) connectWithQR(s *session) {
 // Returns ("", PairingStateError) if the session is already paired.
 // Returns ("", err) on any other failure or timeout.
 func (m *Manager) GetQRPayload(ctx context.Context, sessionID string, timeout time.Duration) (string, error) {
-	slog.Debug("[QR_DEBUG] GetQRPayload called", "session", sessionID, "timeout", timeout)
 	s, err := m.EnsureSession(ctx, sessionID)
 	if err != nil {
-		slog.Error("[QR_ERROR] EnsureSession failed in GetQRPayload",
-			"session", sessionID,
-			"error", err)
 		return "", fmt.Errorf("GetQRPayload: ensure session: %w", err)
 	}
 
 	// If already paired, return an error so the caller can reconnect instead.
 	if s.paired() {
-		slog.Info("[QR_DEBUG] Session already paired, returning PairingStateError",
-			"session", sessionID,
-			"phone", s.phone(),
-			"status", s.getStatus())
 		return "", &PairingStateError{SessionID: sessionID, Phone: s.phone(), Status: s.getStatus()}
 	}
 
@@ -841,7 +798,6 @@ func (m *Manager) GetQRPayload(ctx context.Context, sessionID string, timeout ti
 	s.qrMu.RUnlock()
 
 	if readyCh == nil {
-		slog.Debug("[QR_DEBUG] No QR channel ready yet, waiting for goroutine initialization (1s timeout)", "session", sessionID)
 		// EnsureSession starts connectWithQR in a goroutine; give it up to 1 s to
 		// set qrReadyCh before we assume no goroutine is running.  A single 50 ms
 		// sleep is too short on production (Go scheduler may not have run the
@@ -849,40 +805,38 @@ func (m *Manager) GetQRPayload(ctx context.Context, sessionID string, timeout ti
 		// parallel — the two goroutines would race to overwrite qrReadyCh and one
 		// would inevitably leave it pointing at an abandoned channel → timeout.
 		deadline := time.Now().Add(1 * time.Second)
-		attempts := 0
 		for readyCh == nil && time.Now().Before(deadline) {
-			attempts++
 			time.Sleep(50 * time.Millisecond)
 			s.qrMu.RLock()
 			readyCh = s.qrReadyCh
 			s.qrMu.RUnlock()
 		}
-		slog.Debug("[QR_DEBUG] Completed readyCh polling", "session", sessionID, "attempts", attempts, "channel_ready", readyCh != nil)
 
 		if readyCh == nil {
 			// EnsureSession may have started connectWithRetry (existing paired
 			// session that just disconnected).  Launch a fresh QR goroutine.
-			slog.Info("[QR_DEBUG] Launching manual QR connection goroutine", "session", sessionID)
 			go m.connectWithQR(s)
-			time.Sleep(200 * time.Millisecond)
-			s.qrMu.RLock()
-			readyCh = s.qrReadyCh
-			s.qrMu.RUnlock()
-			slog.Debug("[QR_DEBUG] After manual goroutine launch", "session", sessionID, "channel_ready", readyCh != nil)
+			// Wait up to 500ms for the goroutine to set qrReadyCh.
+			// 200ms was too short on production (Cloud Run cold start / network latency).
+			deadline2 := time.Now().Add(500 * time.Millisecond)
+			for time.Now().Before(deadline2) {
+				time.Sleep(50 * time.Millisecond)
+				s.qrMu.RLock()
+				readyCh = s.qrReadyCh
+				s.qrMu.RUnlock()
+				if readyCh != nil {
+					break
+				}
+			}
 		}
 	}
 
 	if readyCh == nil {
-		slog.Error("[QR_ERROR] Could not start QR flow (readyCh is still nil after all attempts)", "session", sessionID)
 		return "", errors.New("QR flow could not be started")
 	}
 
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-
-	slog.Debug("[QR_DEBUG] Waiting for QR payload to become available", 
-		"session", sessionID, 
-		"timeout", timeout)
 
 	select {
 	case <-readyCh:
@@ -890,23 +844,13 @@ func (m *Manager) GetQRPayload(ctx context.Context, sessionID string, timeout ti
 		payload := s.qrPayload
 		s.qrMu.RUnlock()
 		if payload == "" {
-			slog.Error("[QR_ERROR] QR payload is empty after ready signal", "session", sessionID)
 			return "", errors.New("QR payload is empty after ready signal")
 		}
-		slog.Info("[QR_SUCCESS] GetQRPayload returning QR payload", 
-			"session", sessionID, 
-			"payload_len", len(payload),
-			"payload_prefix", payload[:min(10, len(payload))])
+		slog.Info("GetQRPayload: returning QR payload", "session", sessionID, "payload_len", len(payload))
 		return payload, nil
 	case <-ctx.Done():
-		slog.Error("[QR_ERROR] Context cancelled while waiting for QR payload", 
-			"session", sessionID, 
-			"error", ctx.Err())
 		return "", ctx.Err()
 	case <-timer.C:
-		slog.Error("[QR_TIMEOUT] Timeout waiting for QR code to become available", 
-			"session", sessionID, 
-			"timeout", timeout)
 		return "", errors.New("timeout waiting for QR code to become available")
 	}
 }

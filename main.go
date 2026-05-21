@@ -76,9 +76,13 @@ func main() {
 	// If its DB file didn't exist LoadExisting skipped it; EnsureSession creates it
 	// and starts a QR-code flow so it can be paired immediately.
 	if cfg.DefaultSessionID != "" {
+		slog.Info("ensuring default session", "session_id", cfg.DefaultSessionID)
 		if _, err := mgr.EnsureSession(context.Background(), cfg.DefaultSessionID); err != nil {
 			slog.Warn("could not ensure default session",
 				"session_id", cfg.DefaultSessionID, "error", err)
+		} else {
+			slog.Info("default session ensured — QR flow started if not yet paired",
+				"session_id", cfg.DefaultSessionID)
 		}
 	}
 
@@ -166,7 +170,9 @@ func setupLogger(level string) {
 	default:
 		lvl = slog.LevelInfo
 	}
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: lvl})))
+	// Use JSON handler so Cloud Run / Google Cloud Logging can parse structured fields.
+	// Text handler is readable locally but unstructured in production log viewers.
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lvl})))
 }
 
 // ginLogger returns a minimal Gin middleware that uses slog.

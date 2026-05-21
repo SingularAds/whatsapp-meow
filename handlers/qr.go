@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
@@ -47,9 +46,8 @@ func QRPayloadHandler(mgr *client.Manager) gin.HandlerFunc {
 			var pairingErr *client.PairingStateError
 			if errors.As(err, &pairingErr) {
 				// Session is already paired — instruct caller to reconnect.
-				slog.Info("[QR_HANDLER] Session already paired, returning 409 Conflict",
+				slog.Info("QRPayloadHandler: session already paired",
 					"session", req.SessionID,
-					"phone", pairingErr.Phone,
 					"status", pairingErr.Status,
 				)
 				c.JSON(http.StatusConflict, gin.H{
@@ -62,25 +60,20 @@ func QRPayloadHandler(mgr *client.Manager) gin.HandlerFunc {
 				})
 				return
 			}
-			slog.Error("[QR_HANDLER_ERROR] GetQRPayload failed, returning 500 Internal Server Error",
+			slog.Error("QRPayloadHandler: GetQRPayload failed",
 				"session", req.SessionID,
-				"requested_timeout", timeout.String(),
-				"error", err.Error(),
-				"error_type", fmt.Sprintf("%T", err),
+				"error", err,
 			)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error":     "failed to get QR payload: " + err.Error(),
+				"sessionId": req.SessionID,
+			})
 			return
 		}
 
-		slog.Info("[QR_HANDLER_SUCCESS] Returning QR payload, 200 OK",
+		slog.Info("QRPayloadHandler: returning QR payload",
 			"session", req.SessionID,
 			"payload_len", len(payload),
-			"payload_prefix", func(p string) string {
-				if len(p) > 20 {
-					return p[:20]
-				}
-				return p
-			}(payload),
 		)
 		c.JSON(http.StatusOK, gin.H{
 			"qr_payload": payload,
@@ -98,15 +91,12 @@ func QRCurrentHandler(mgr *client.Manager) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		sessionID := c.Param("session_id")
 		if sessionID == "" {
-			slog.Error("[QR_CURRENT_ERROR] Missing session_id parameter")
 			c.JSON(http.StatusBadRequest, gin.H{"error": "session_id is required"})
 			return
 		}
 
-		slog.Debug("[QR_CURRENT_DEBUG] Polling for current QR payload", "session", sessionID)
 		payload, ok := mgr.GetCurrentQRPayload(sessionID)
 		if !ok {
-			slog.Debug("[QR_CURRENT_DEBUG] No active QR payload found, returning 404", "session", sessionID)
 			c.JSON(http.StatusNotFound, gin.H{
 				"error":     "no active QR payload for this session",
 				"sessionId": sessionID,
@@ -114,9 +104,6 @@ func QRCurrentHandler(mgr *client.Manager) gin.HandlerFunc {
 			return
 		}
 
-		slog.Debug("[QR_CURRENT_SUCCESS] Returning active QR payload",
-			"session", sessionID,
-			"payload_len", len(payload))
 		c.JSON(http.StatusOK, gin.H{
 			"qr_payload": payload,
 			"sessionId":  sessionID,
