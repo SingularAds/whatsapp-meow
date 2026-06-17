@@ -143,14 +143,10 @@ type Manager struct {
 	sender    *webhook.Sender
 
 	// defaultSessionID is the global onboarding session (e.g. "smba").
-	// Messages arriving on this session bypass the intent classifier so every
-	// first-contact customer message reaches the Python onboarding service,
-	// regardless of whether it matches a business/personal keyword pattern.
+	// Messages arriving on this session bypass the relationship filter so
+	// every first-contact customer message reaches the Python onboarding
+	// service, regardless of how the contact happens to be saved.
 	defaultSessionID string
-
-	// intentStore caches per-chat business/personal classification so the
-	// bridge avoids re-classifying every message in an already-known thread.
-	intentStore *intent.StateStore
 
 	// tracker is the PostHog analytics client. It is always non-nil; when
 	// PostHog is unconfigured the tracker is a no-op.
@@ -168,9 +164,9 @@ type callEntry struct {
 
 // NewManager creates an empty Manager.
 // defaultSessionID is the global onboarding session ID (e.g. "smba");
-// messages on that session bypass the intent classifier so all customer
+// messages on that session bypass the relationship filter so all customer
 // first-contact messages reach the Python onboarding service.
-func NewManager(dbDir, mediaDir, publicURL string, sender *webhook.Sender, intentStore *intent.StateStore, tracker *analytics.Tracker, defaultSessionID string) *Manager {
+func NewManager(dbDir, mediaDir, publicURL string, sender *webhook.Sender, tracker *analytics.Tracker, defaultSessionID string) *Manager {
 	return &Manager{
 		sessions:         make(map[string]*session),
 		calls:            make(map[string]*callEntry),
@@ -179,7 +175,6 @@ func NewManager(dbDir, mediaDir, publicURL string, sender *webhook.Sender, inten
 		publicURL:        publicURL,
 		sender:           sender,
 		defaultSessionID: defaultSessionID,
-		intentStore:      intentStore,
 		tracker:          tracker,
 	}
 }
@@ -1168,14 +1163,35 @@ func (m *Manager) handleIncoming(s *session, evt *events.Message) {
 		"is_group", info.IsGroup,
 	)
 
-	// ── Guard 1: outbound-echo suppression (is_from_me=true) ─────────────────
+	// ── Guard 1: outbound-echo handling (is_from_me=true) ────────────────────
 	// When we call SendMessage() the WhatsApp server echoes it back as an
-	// events.Message with IsFromMe=true.  The Python backend has no use for
-	// these — drop them here so they never reach the webhook endpoint.
+	// events.Message with IsFromMe=true. There are two sources:
+	//   (a) Messages WE sent via /send/message — AI replies, owner-command
+	//       replies, automations. The Python backend filters these via
+	//       is_our_outbound_echo(message_id).
+	//   (b) Messages the OWNER manually typed on their primary device in a
+	//       customer chat. These are the "owner takeover" signal — the
+	//       backend pauses AI for that customer when it sees one.
+	//
+	// We can't tell (a) from (b) at the bridge layer (both look identical
+	// from the protocol). Strategy: forward 1:1 customer-chat outbound
+	// echoes as event=owner_message; the backend filters out (a). Group
+	// echoes and self-chat echoes are still dropped here — they are never
+	// "the owner replying to a customer".
 	if info.IsFromMe {
-		slog.Debug("[bridge] skipping outbound echo (is_from_me=true)",
-			"session", s.id, "id", info.ID, "chat", info.Chat.User)
-		m.tracker.TrackMessageTypeFiltered(s.id, info.Chat.User, "outbound_echo")
+		if info.IsGroup {
+			slog.Debug("[bridge] skipping outbound group echo",
+				"session", s.id, "id", info.ID, "chat", info.Chat.User)
+			m.tracker.TrackMessageTypeFiltered(s.id, info.Chat.User, "outbound_echo_group")
+			return
+		}
+		if s.phone() != "" && info.Chat.User == s.phone() {
+			slog.Debug("[bridge] skipping outbound self-chat echo",
+				"session", s.id, "id", info.ID, "chat", info.Chat.User)
+			m.tracker.TrackMessageTypeFiltered(s.id, info.Chat.User, "outbound_echo_self")
+			return
+		}
+		go m.forwardOwnerOutbound(s, evt)
 		return
 	}
 
@@ -1254,18 +1270,36 @@ func (m *Manager) handleIncoming(s *session, evt *events.Message) {
 			ctx := context.Background()
 			if pnJID, err := s.container.LIDMap.GetPNForLID(ctx, info.Sender); err == nil && !pnJID.IsEmpty() {
 				senderPN = pnJID.String()
-				// Use real phone digits as chat_id so backend DB operations bind
-				// to the customer's stable phone number rather than the LID.
-				chatID = pnJID.User
-				slog.Info("[bridge] resolved LID to PN",
+				slog.Info("[bridge] resolved Sender LID to PN",
 					"session", s.id,
 					"lid", from,
 					"pn", senderPN,
 				)
 			} else {
-				slog.Debug("[bridge] LID not yet in cache — using LID digits as customer key",
+				slog.Debug("[bridge] Sender LID not yet in cache",
 					"session", s.id,
 					"lid", from,
+				)
+			}
+		}
+
+		// Resolve chat_id from the Chat JID (not the Sender JID).
+		// For outbound messages (is_from_me=true), info.Sender is the owner,
+		// but info.Chat is the customer — so we must resolve Chat, not Sender,
+		// to get the correct customer phone number as chatID.
+		if info.Chat.Server == types.HiddenUserServer {
+			ctx := context.Background()
+			if chatPNJID, err := s.container.LIDMap.GetPNForLID(ctx, info.Chat); err == nil && !chatPNJID.IsEmpty() {
+				chatID = chatPNJID.User
+				slog.Info("[bridge] resolved Chat LID to PN",
+					"session", s.id,
+					"chat_lid", info.Chat.String(),
+					"chat_pn", chatPNJID.String(),
+				)
+			} else {
+				slog.Debug("[bridge] Chat LID not yet in cache — using LID digits as customer key",
+					"session", s.id,
+					"chat_lid", info.Chat.String(),
 				)
 			}
 		}
@@ -1279,55 +1313,27 @@ func (m *Manager) handleIncoming(s *session, evt *events.Message) {
 		// Track that this message passed all guards and reached the AI pipeline.
 		m.tracker.TrackMessageReceived(s.id, chatID, msgType, info.PushName)
 
-		// -- Intent classification --------------------------------------------------
-		// The global onboarding session (smba) handles ALL first-contact customer
-		// messages regardless of content — the Python onboarding service needs to
-		// see every message to drive the onboarding state machine.  Applying the
-		// intent filter here would silently drop messages that don't match a
-		// business keyword (e.g. "I run a restaurant in Lisbon") and break the flow.
+		// -- Personal-relationship gate --------------------------------------------
+		// The bridge's only intent decision is: did the owner save this contact
+		// with a personal-relationship label (Mom, Dad, Bhai, ...)? If yes, the
+		// AI must never reply, no matter what the message says. Everything else
+		// is forwarded to the Python backend, which runs an LLM-based classifier
+		// with conversation history to decide whether to reply.
+		//
+		// The global onboarding session (smba) skips even this check — the
+		// onboarding service expects every first-contact message.
 		if m.defaultSessionID != "" && s.id == m.defaultSessionID {
-			slog.Info("[bridge] onboarding session — bypassing intent filter, forwarding to Python",
+			slog.Info("[bridge] onboarding session — bypassing relationship filter, forwarding to Python",
 				"session", s.id, "chat", chatID)
-			m.tracker.TrackBusinessIntent(s.id, chatID)
 		} else {
-			// Use the StateStore cache where available; fall back to heuristic
-			// classification from the message text.  Media messages with no text body
-			// are treated as business by default (customers routinely send voice notes
-			// and images on a business number).
-			var msgIntent intent.Intent
-			fromCache := false
-			if cachedIntent, ok := m.intentStore.Get(chatID); ok {
-				msgIntent = cachedIntent
-				fromCache = true
-			} else if body != "" {
-				msgIntent = intent.Classify(body)
-			} else {
-				// No textual signal - fail-open as business (media message).
-				msgIntent = intent.IntentBusiness
-			}
-			m.tracker.TrackIntentClassified(s.id, chatID, msgIntent.String(), fromCache)
-
-			switch msgIntent {
-			case intent.IntentBusiness:
-				// Refresh cache so the TTL resets on continued business conversation.
-				m.intentStore.Set(chatID, intent.IntentBusiness)
-				m.tracker.TrackBusinessIntent(s.id, chatID)
-				slog.Info("[bridge] intent: business - forwarding to AI",
-					"session", s.id, "chat", chatID, "from_cache", fromCache)
-
-			case intent.IntentPersonal:
-				m.intentStore.Set(chatID, intent.IntentPersonal)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			savedName, isPersonal := m.ownerSavedRelationshipName(ctx, s, info.Sender)
+			cancel()
+			if isPersonal {
 				m.tracker.TrackPersonalIntent(s.id, chatID)
-				m.tracker.TrackAIReplySkipped(s.id, chatID, info.ID, "personal_intent")
-				slog.Info("[bridge] intent: personal - skipping AI reply",
-					"session", s.id, "chat", chatID, "msg_id", info.ID, "from_cache", fromCache)
-				return
-
-			default: // IntentUnclear - do not cache; re-evaluate on the next message.
-				m.tracker.TrackUnclearIntent(s.id, chatID)
-				m.tracker.TrackAIReplySkipped(s.id, chatID, info.ID, "unclear_intent")
-				slog.Info("[bridge] intent: unclear - skipping AI reply",
-					"session", s.id, "chat", chatID, "msg_id", info.ID)
+				m.tracker.TrackAIReplySkipped(s.id, chatID, info.ID, "personal_contact")
+				slog.Info("[bridge] skipping — sender is saved as a personal relation",
+					"session", s.id, "chat", chatID, "msg_id", info.ID, "saved_name", savedName)
 				return
 			}
 		}
@@ -1355,6 +1361,106 @@ func (m *Manager) handleIncoming(s *session, evt *events.Message) {
 		m.sender.Send(payload)
 		m.tracker.TrackAIReplySent(s.id, chatID, info.ID, msgType)
 	}()
+}
+
+// forwardOwnerOutbound posts a 1:1 outbound echo to the backend as
+// event=owner_message so the backend can detect owner takeover.
+//
+// The backend is responsible for distinguishing real owner-typed messages
+// from API-sent messages (AI replies, automations) by checking the
+// message_id against its own outbound-id cache; we forward both because
+// the bridge cannot tell them apart from the protocol alone.
+func (m *Manager) forwardOwnerOutbound(s *session, evt *events.Message) {
+	info := evt.Info
+	msgType, body, mediaURL, mimeType := classifyMessage(s, m, evt)
+	if msgType == "" {
+		// Unsupported type (sticker, reaction, etc.) — owner sending these
+		// doesn't indicate takeover so we drop silently.
+		return
+	}
+
+	// chat_id must be the customer's real phone number (not a LID) so the
+	// Python backend can look up the correct Firestore conversation document.
+	// For privacy-mode contacts info.Chat.User is a LID string; resolve it.
+	chatID := info.Chat.User
+	if info.Chat.Server == types.HiddenUserServer {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if chatPNJID, err := s.container.LIDMap.GetPNForLID(ctx, info.Chat); err == nil && !chatPNJID.IsEmpty() {
+			chatID = chatPNJID.User
+			slog.Info("[bridge] forwardOwnerOutbound: resolved Chat LID to PN",
+				"session", s.id,
+				"chat_lid", info.Chat.String(),
+				"chat_pn", chatPNJID.String(),
+			)
+		} else {
+			slog.Debug("[bridge] forwardOwnerOutbound: Chat LID not in cache — using LID digits",
+				"session", s.id,
+				"chat_lid", info.Chat.String(),
+			)
+		}
+	}
+
+	ownPhone := ""
+	if s.client.Store.ID != nil {
+		ownPhone = s.client.Store.ID.User
+	}
+
+	m.sender.Send(webhook.Event{
+		Event:    "owner_message",
+		DeviceID: s.id,
+		Phone:    ownPhone,
+		Payload: webhook.MessagePayload{
+			ChatID:      chatID,
+			From:        info.Sender.ToNonAD().String(),
+			PushName:    info.PushName,
+			Body:        body,
+			MessageID:   info.ID,
+			Timestamp:   info.Timestamp.Unix(),
+			IsFromMe:    true,
+			IsGroup:     false,
+			MessageType: msgType,
+			MediaURL:    mediaURL,
+			MimeType:    mimeType,
+		},
+	})
+}
+
+// ownerSavedRelationshipName returns (label, true) when the sender appears in
+// the owner's saved address book under a personal-relationship label (Mom,
+// Dad, Bhai, etc.). Returns ("", false) when the contact is unsaved or saved
+// under a non-relationship label (e.g. the customer's actual name).
+//
+// For senders using @lid privacy mode the function tries the LID JID first
+// and then the resolved phone-number JID, since address-book contacts are
+// usually keyed by phone JID.
+func (m *Manager) ownerSavedRelationshipName(ctx context.Context, s *session, senderJID types.JID) (string, bool) {
+	candidates := []types.JID{senderJID.ToNonAD()}
+	if senderJID.Server == types.HiddenUserServer {
+		if pnJID, err := s.container.LIDMap.GetPNForLID(ctx, senderJID); err == nil && !pnJID.IsEmpty() {
+			candidates = append(candidates, pnJID)
+		}
+	}
+
+	for _, jid := range candidates {
+		info, err := s.client.Store.Contacts.GetContact(ctx, jid)
+		if err != nil {
+			slog.Debug("[bridge] contact lookup failed",
+				"session", s.id, "jid", jid.String(), "error", err)
+			continue
+		}
+		if !info.Found {
+			continue
+		}
+		// Check the owner's labels (FirstName, FullName) — NOT PushName, which
+		// is the sender's chosen WhatsApp display name and is attacker-controlled.
+		for _, label := range []string{info.FullName, info.FirstName} {
+			if intent.IsPersonalContactName(label) {
+				return label, true
+			}
+		}
+	}
+	return "", false
 }
 
 func classifyMessage(s *session, m *Manager, evt *events.Message) (msgType, body, mediaURL, mimeType string) {
