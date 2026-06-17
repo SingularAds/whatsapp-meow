@@ -18,7 +18,6 @@ import (
 	"whatsapp-bridge/client"
 	"whatsapp-bridge/config"
 	"whatsapp-bridge/handlers"
-	"whatsapp-bridge/intent"
 	"whatsapp-bridge/middleware"
 	"whatsapp-bridge/webhook"
 )
@@ -56,9 +55,6 @@ func main() {
 		)
 	}
 
-	// Intent state store: caches per-chat business/personal classification.
-	intentStore := intent.NewStateStore()
-
 	// PostHog tracker: no-op when POSTHOG_API_KEY is empty.
 	tracker := analytics.NewTracker(cfg.PostHogAPIKey, cfg.PostHogHost)
 	if cfg.PostHogAPIKey != "" {
@@ -67,7 +63,7 @@ func main() {
 		slog.Info("[analytics] PostHog tracking disabled (POSTHOG_API_KEY not set)")
 	}
 
-	mgr := client.NewManager(cfg.DBDir, mediaDir, cfg.PublicURL, sender, intentStore, tracker, cfg.DefaultSessionID)
+	mgr := client.NewManager(cfg.DBDir, mediaDir, cfg.PublicURL, sender, tracker, cfg.DefaultSessionID)
 
 	// Load sessions that already have databases on disk.
 	mgr.LoadExisting(context.Background())
@@ -144,7 +140,6 @@ func main() {
 
 	slog.Info("shutting down…")
 	cleanupCancel()
-	intentStore.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if err := mgr.Close(ctx); err != nil {
