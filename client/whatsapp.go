@@ -1622,8 +1622,17 @@ func ParsePhone(phone string) (types.JID, error) {
 }
 
 // BuildTextMessage wraps plain text in a waE2E.Message.
+//
+// ExtendedTextMessage is used instead of the bare Conversation field so that
+// WhatsApp clients apply full markdown rendering: bold (*text*), italic
+// (_text_), monospace (`text`), and — critically — code blocks with the
+// copy-icon button (```text```).  Conversation messages are treated as raw
+// text by many WhatsApp clients and skip code-block formatting entirely.
 func BuildTextMessage(text string) *waE2E.Message {
 	return &waE2E.Message{
-		Conversation: proto.String(text),
+		ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+			Text:        proto.String(text),
+			PreviewType: waE2E.ExtendedTextMessage_NONE.Enum(),
+		},
 	}
 }
