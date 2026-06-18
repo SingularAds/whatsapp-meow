@@ -98,6 +98,9 @@ func main() {
 	auth := middleware.BasicAuth(cfg.BridgeUsername, cfg.BridgePassword)
 
 	router.POST("/send/message", auth, handlers.SendMessageHandler(mgr, time.Duration(cfg.WhatsAppOpTimeoutSeconds)*time.Second))
+	// Typing-bubble / "recording…" presence — used by the Python backend to
+	// show activity while the LLM is generating a reply.
+	router.POST("/send/presence", auth, handlers.SendPresenceHandler(mgr))
 	router.GET("/media/*filename", auth, handlers.MediaHandler(mediaDir))
 	router.GET("/api/sessions", auth, handlers.SessionsListHandler(mgr))
 	router.GET("/api/sessions/:session_id", auth, handlers.SessionHandler(mgr))
