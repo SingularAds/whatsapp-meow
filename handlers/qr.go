@@ -8,7 +8,8 @@ import (
 
     "github.com/gin-gonic/gin"
 
-    "whatsapp-bridge/client"
+	"whatsapp-bridge/analytics"
+	"whatsapp-bridge/client"
 )
 
 type qrPayloadRequest struct {
@@ -22,13 +23,13 @@ type qrPayloadRequest struct {
 // the first QR code payload is available (up to timeoutSeconds, default 15 s).
 // The returned payload is the raw QR string that the caller must convert into a
 // QR image and present to the end-user for scanning.
-func QRPayloadHandler(mgr *client.Manager) gin.HandlerFunc {
-    return func(c *gin.Context) {
-        var req qrPayloadRequest
-        if err := c.ShouldBindJSON(&req); err != nil {
-            c.JSON(http.StatusBadRequest, gin.H{"error": "sessionId is required"})
-            return
-        }
+func QRPayloadHandler(mgr *client.Manager, tracker *analytics.Tracker) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req qrPayloadRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "sessionId is required"})
+			return
+		}
 
         // Clamp the caller-supplied timeout to a safe range.
         timeout := 15 * time.Second
@@ -71,15 +72,16 @@ func QRPayloadHandler(mgr *client.Manager) gin.HandlerFunc {
             return
         }
 
-        slog.Info("QRPayloadHandler: returning QR payload",
-            "session", req.SessionID,
-            "payload_len", len(payload),
-        )
-        c.JSON(http.StatusOK, gin.H{
-            "qr_payload": payload,
-            "sessionId":  req.SessionID,
-        })
-    }
+		slog.Info("QRPayloadHandler: returning QR payload",
+			"session", req.SessionID,
+			"payload_len", len(payload),
+		)
+		tracker.TrackQRInitiated(req.SessionID)
+		c.JSON(http.StatusOK, gin.H{
+			"qr_payload": payload,
+			"sessionId":  req.SessionID,
+		})
+	}
 }
 
 // QRCurrentHandler returns a Gin handler for GET /api/qr-current/:session_id.

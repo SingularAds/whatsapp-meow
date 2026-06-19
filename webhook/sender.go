@@ -3,10 +3,13 @@ package webhook
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
+
+	"whatsapp-bridge/analytics"
 )
 
 // MessagePayload mirrors the payload object that FastAPI expects.
@@ -55,14 +58,16 @@ type Sender struct {
 	webhookURL    string
 	webhookSecret string
 	client        *http.Client
+	tracker       *analytics.Tracker
 }
 
-// NewSender creates a Sender. webhookSecret may be empty.
-func NewSender(webhookURL, webhookSecret string) *Sender {
+// NewSender creates a Sender. webhookSecret may be empty. tracker must be non-nil.
+func NewSender(webhookURL, webhookSecret string, tracker *analytics.Tracker) *Sender {
 	return &Sender{
 		webhookURL:    webhookURL,
 		webhookSecret: webhookSecret,
 		client:        &http.Client{Timeout: 10 * time.Second},
+		tracker:       tracker,
 	}
 }
 
@@ -105,6 +110,7 @@ func (s *Sender) Send(evt Event) {
 					"device_id", evt.DeviceID,
 					"message_id", evt.Payload.MessageID,
 				)
+				s.tracker.TrackWebhookError(evt.DeviceID, evt.Payload.MessageID, errors.New("permanent webhook failure after retries"))
 			}
 			continue
 		}
