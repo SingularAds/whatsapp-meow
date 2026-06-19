@@ -8,6 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"whatsapp-bridge/analytics"
 	"whatsapp-bridge/client"
 )
 
@@ -22,7 +23,7 @@ type qrPayloadRequest struct {
 // the first QR code payload is available (up to timeoutSeconds, default 15 s).
 // The returned payload is the raw QR string that the caller must convert into a
 // QR image and present to the end-user for scanning.
-func QRPayloadHandler(mgr *client.Manager) gin.HandlerFunc {
+func QRPayloadHandler(mgr *client.Manager, tracker *analytics.Tracker) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req qrPayloadRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
@@ -75,6 +76,7 @@ func QRPayloadHandler(mgr *client.Manager) gin.HandlerFunc {
 			"session", req.SessionID,
 			"payload_len", len(payload),
 		)
+		tracker.TrackQRInitiated(req.SessionID)
 		c.JSON(http.StatusOK, gin.H{
 			"qr_payload": payload,
 			"sessionId":  req.SessionID,

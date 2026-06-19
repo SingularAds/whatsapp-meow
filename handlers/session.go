@@ -5,6 +5,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"whatsapp-bridge/analytics"
 	"whatsapp-bridge/client"
 )
 
@@ -36,7 +37,7 @@ func SessionsListHandler(mgr *client.Manager) gin.HandlerFunc {
 }
 
 // SessionReconnectHandler returns a Gin handler for POST /api/sessions/:session_id/reconnect.
-func SessionReconnectHandler(mgr *client.Manager) gin.HandlerFunc {
+func SessionReconnectHandler(mgr *client.Manager, tracker *analytics.Tracker) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		sessionID := c.Param("session_id")
 		if sessionID == "" {
@@ -52,6 +53,7 @@ func SessionReconnectHandler(mgr *client.Manager) gin.HandlerFunc {
 			return
 		}
 
+		tracker.TrackSessionReconnected(sessionID)
 		status, phone, paired := mgr.GetStatus(sessionID)
 		c.JSON(http.StatusAccepted, gin.H{
 			"sessionId":        sessionID,
@@ -66,7 +68,7 @@ func SessionReconnectHandler(mgr *client.Manager) gin.HandlerFunc {
 
 // SessionLogoutHandler returns a Gin handler for POST /api/sessions/:session_id/logout.
 // It fully unpairs the session so that a fresh pair-code flow can be run.
-func SessionLogoutHandler(mgr *client.Manager) gin.HandlerFunc {
+func SessionLogoutHandler(mgr *client.Manager, tracker *analytics.Tracker) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		sessionID := c.Param("session_id")
 		if sessionID == "" {
@@ -82,6 +84,7 @@ func SessionLogoutHandler(mgr *client.Manager) gin.HandlerFunc {
 			return
 		}
 
+		tracker.TrackSessionLoggedOut(sessionID, "owner_initiated")
 		status, phone, paired := mgr.GetStatus(sessionID)
 		c.JSON(http.StatusOK, gin.H{
 			"sessionId":        sessionID,

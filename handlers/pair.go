@@ -7,6 +7,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"whatsapp-bridge/analytics"
 	"whatsapp-bridge/client"
 )
 
@@ -16,7 +17,7 @@ type pairCodeRequest struct {
 }
 
 // PairCodeHandler returns a Gin handler for POST /api/pair-code
-func PairCodeHandler(mgr *client.Manager) gin.HandlerFunc {
+func PairCodeHandler(mgr *client.Manager, tracker *analytics.Tracker) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req pairCodeRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
@@ -63,6 +64,7 @@ func PairCodeHandler(mgr *client.Manager) gin.HandlerFunc {
 			"session", req.SessionID,
 			"code_len", len(code),
 		)
+		tracker.TrackPairCodeGenerated(req.SessionID)
 		c.JSON(http.StatusOK, gin.H{
 			"code":      code,
 			"sessionId": req.SessionID,

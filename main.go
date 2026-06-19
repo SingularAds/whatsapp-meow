@@ -40,7 +40,16 @@ func main() {
 	}
 
 	// ── Core services ───────────────────────────────────────────────────────────
-	sender := webhook.NewSender(cfg.WebhookURL, cfg.WebhookSecret)
+	// PostHog tracker: no-op when POSTHOG_API_KEY is empty.
+	// Must be created before sender so webhook errors can be tracked.
+	tracker := analytics.NewTracker(cfg.PostHogAPIKey, cfg.PostHogHost)
+	if cfg.PostHogAPIKey != "" {
+		slog.Info("[analytics] PostHog tracking enabled", "host", cfg.PostHogHost)
+	} else {
+		slog.Info("[analytics] PostHog tracking disabled (POSTHOG_API_KEY not set)")
+	}
+
+	sender := webhook.NewSender(cfg.WebhookURL, cfg.WebhookSecret, tracker)
 
 	// Always log the webhook destination at startup so Cloud Run logs confirm
 	// the correct backend URL is in use.  A localhost URL in production is the
@@ -53,14 +62,6 @@ func main() {
 		slog.Warn("WEBHOOK_URL appears to be a localhost address — webhooks will NOT reach the Python backend in production. Set WEBHOOK_URL to the Cloud Run backend URL.",
 			"webhook_url", cfg.WebhookURL,
 		)
-	}
-
-	// PostHog tracker: no-op when POSTHOG_API_KEY is empty.
-	tracker := analytics.NewTracker(cfg.PostHogAPIKey, cfg.PostHogHost)
-	if cfg.PostHogAPIKey != "" {
-		slog.Info("[analytics] PostHog tracking enabled", "host", cfg.PostHogHost)
-	} else {
-		slog.Info("[analytics] PostHog tracking disabled (POSTHOG_API_KEY not set)")
 	}
 
 	mgr := client.NewManager(cfg.DBDir, mediaDir, cfg.PublicURL, sender, tracker, cfg.DefaultSessionID)
@@ -104,9 +105,9 @@ func main() {
 	router.GET("/media/*filename", auth, handlers.MediaHandler(mediaDir))
 	router.GET("/api/sessions", auth, handlers.SessionsListHandler(mgr))
 	router.GET("/api/sessions/:session_id", auth, handlers.SessionHandler(mgr))
-	router.POST("/api/sessions/:session_id/reconnect", auth, handlers.SessionReconnectHandler(mgr))
-	router.POST("/api/sessions/:session_id/logout", auth, handlers.SessionLogoutHandler(mgr))
-	router.POST("/api/pair-code", auth, handlers.PairCodeHandler(mgr))
+	router.POST("/api/sessions/:session_id/reconnect", auth, handlers.SessionReconnectHandler(mgr, tracker))
+	router.POST("/api/sessions/:session_id/logout", auth, handlers.SessionLogoutHandler(mgr, tracker))
+	router.POST("/api/pair-code", auth, handlers.PairCodeHandler(mgr, tracker))
 	router.GET("/api/default-session", auth, handlers.DefaultSessionStatusHandler(mgr, cfg.DefaultSessionID))
 	router.POST("/api/default-session/reconnect", auth, handlers.DefaultSessionReconnectHandler(mgr, cfg.DefaultSessionID))
 	router.POST("/api/default-session/pair-code", auth, handlers.DefaultSessionPairCodeHandler(mgr, cfg.DefaultSessionID))
@@ -114,7 +115,7 @@ func main() {
 	// QR-code pairing flow:
 	// POST /api/qr-payload   — start (or reuse) QR session, block until first payload ready
 	// GET  /api/qr-current/:session_id — fetch the latest payload without blocking (for refresh)
-	router.POST("/api/qr-payload", auth, handlers.QRPayloadHandler(mgr))
+	router.POST("/api/qr-payload", auth, handlers.QRPayloadHandler(mgr, tracker))
 	router.GET("/api/qr-current/:session_id", auth, handlers.QRCurrentHandler(mgr))
 
 	// ── HTTP server with graceful shutdown ────────────────────────────────────

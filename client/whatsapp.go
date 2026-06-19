@@ -720,6 +720,7 @@ func (m *Manager) connectWithQR(s *session) {
 		case "login":
 			slog.Info("QR login successful, waiting for full connection", "session", s.id)
 			s.setStatus(StatusConnecting)
+			m.tracker.TrackSessionPaired(s.id, "qr")
 
 			// Wait up to 30 seconds for the connection to be fully authenticated.
 			// Increased from 20s to handle slower networks.
@@ -921,10 +922,12 @@ func (m *Manager) makeEventHandler(s *session) func(interface{}) {
 		case *events.Connected:
 			s.setStatus(StatusConnected)
 			slog.Info("WhatsApp connected", "session", s.id)
+			m.tracker.TrackSessionConnected(s.id)
 
 		case *events.Disconnected:
 			s.setStatus(StatusDisconnected)
 			slog.Info("WhatsApp disconnected", "session", s.id)
+			m.tracker.TrackSessionDisconnected(s.id)
 
 		case *events.LoggedOut:
 			// WhatsApp has revoked this session's credentials server-side.
@@ -937,6 +940,7 @@ func (m *Manager) makeEventHandler(s *session) func(interface{}) {
 			// a brand-new client with genuinely fresh key material.
 			slog.Warn("WhatsApp force-logout received – purging session and DB for clean re-pair",
 				"session", s.id)
+			m.tracker.TrackSessionLoggedOut(s.id, "force_revoked")
 			s.client.Disconnect()
 			s.setStatus(StatusNeedsPairing)
 			m.mu.Lock()
