@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/base64"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -103,13 +104,28 @@ func SendMessageHandler(mgr *client.Manager, opTimeout time.Duration) gin.Handle
 func handleText(c *gin.Context, wac *whatsmeow.Client, jidStr, text string, opTimeout time.Duration) {
 	jid, _ := client.ParsePhone(jidStr)
 	msg := client.BuildTextMessage(text)
+	payloadType := "conversation"
+	if msg.GetExtendedTextMessage() != nil {
+		payloadType = "extended_text"
+	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), opTimeout)
 	defer cancel()
 	resp, err := wac.SendMessage(ctx, jid, msg)
 	if err != nil {
+		slog.Error("[bridge] SendMessage failed",
+			"to", jid.String(),
+			"payload_type", payloadType,
+			"text_len", len(text),
+			"error", err.Error(),
+		)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	slog.Info("[bridge] SendMessage ok",
+		"to", jid.String(),
+		"payload_type", payloadType,
+		"message_id", resp.ID,
+	)
 	c.JSON(http.StatusOK, gin.H{"status": "sent", "message_id": resp.ID})
 }
 
