@@ -1627,16 +1627,42 @@ func ParsePhone(phone string) (types.JID, error) {
 
 // BuildTextMessage wraps plain text in a waE2E.Message.
 //
-// ExtendedTextMessage is used instead of the bare Conversation field so that
-// WhatsApp clients apply full markdown rendering: bold (*text*), italic
-// (_text_), monospace (`text`), and — critically — code blocks with the
-// copy-icon button (```text```).  Conversation messages are treated as raw
-// text by many WhatsApp clients and skip code-block formatting entirely.
+// Plain text goes through the Conversation field, which is the lowest-scrutiny
+// path on WhatsApp's anti-abuse pipeline. Only when the text actually contains
+// WhatsApp markdown ( *bold* _italic_ `monospace` ~strike~ or ```code``` ) do
+// we switch to ExtendedTextMessage so clients render the formatting.
+//
+// Why this matters: ExtendedTextMessage is the "rich" message type WhatsApp
+// associates with link previews, mentions, and broadcast-style content. From
+// non-official multi-device clients (whatsmeow, Baileys, …) it triggers much
+// stricter cold-contact rate-limiting — specifically the "reach-out time-lock"
+// (server error 463 / NackCallerReachoutTimelocked) that rejects first-contact
+// outbound messages to numbers with no prior 2-way history. Using Conversation
+// for the common plain-text case keeps onboarding greetings and other cold
+// outbound messages on the safe path while preserving markdown rendering for
+// the rare case where it's actually needed.
 func BuildTextMessage(text string) *waE2E.Message {
+	if !hasWhatsAppFormatting(text) {
+		slog.Info("[bridge] BuildTextMessage → Conversation (plain text)", "len", len(text))
+		return &waE2E.Message{
+			Conversation: proto.String(text),
+		}
+	}
+	slog.Info("[bridge] BuildTextMessage → ExtendedTextMessage (formatting detected)", "len", len(text))
 	return &waE2E.Message{
 		ExtendedTextMessage: &waE2E.ExtendedTextMessage{
 			Text:        proto.String(text),
 			PreviewType: waE2E.ExtendedTextMessage_NONE.Enum(),
 		},
 	}
+}
+
+// hasWhatsAppFormatting reports whether the text contains any character that
+// WhatsApp uses as a markdown delimiter. A cheap byte-scan is enough: if none
+// of these characters appear, no rendering decision is being made, so the
+// safer Conversation path is fine. False positives (a stray '*' that isn't
+// actually a delimiter) are harmless — the worst case is sending a clean text
+// down the ExtendedTextMessage path, which is the prior behavior.
+func hasWhatsAppFormatting(text string) bool {
+	return strings.ContainsAny(text, "*_`~")
 }
