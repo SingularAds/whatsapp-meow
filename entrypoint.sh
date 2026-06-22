@@ -63,15 +63,31 @@ _gcs_download() {
     local bucket="$1" object="$2" dest="$3"
     local token
     token=$(_gcs_token) || return 1
-    # URL-encode slashes in the object name (%2F) if needed — not needed here.
-    curl -sS \
+
+    local tmp status
+    tmp="$(mktemp)"
+    status=$(curl -sS \
         --connect-timeout "${_CURL_CONNECT_TIMEOUT}" \
         --max-time "${_CURL_MAX_TIME}" \
         --retry 3 \
         --retry-delay 1 \
+        -w "%{http_code}" \
+        -o "$tmp" \
         -H "Authorization: Bearer ${token}" \
-        "https://storage.googleapis.com/storage/v1/b/${bucket}/o/${object}?alt=media" \
-        -o "${dest}" 2>/dev/null
+        "https://storage.googleapis.com/storage/v1/b/${bucket}/o/${object}?alt=media" 2>/dev/null
+    ) || status="000"
+
+    case "$status" in
+        ''|*[!0-9]*) status="000" ;;
+    esac
+
+    if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
+        mv "$tmp" "$dest"
+        return 0
+    else
+        rm -f "$tmp"
+        return 1
+    fi
 }
 
 # _gcs_upload_multi fetches a single token and uploads multiple files in one shot.
