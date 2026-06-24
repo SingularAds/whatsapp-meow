@@ -102,6 +102,20 @@ type session struct {
 	// valid and its SQLite file was just created this run; purging it would
 	// destroy good keys and cause WhatsApp to reject the subsequent PairPhone.
 	initializedInProcess bool
+
+	// pairCodeInFlight is set by GeneratePairCode while it owns the websocket
+	// lifecycle for a pair-code flow. While true, connectWithQR must NOT
+	// auto-restart itself when its QR channel closes — otherwise a parallel QR
+	// goroutine will spin up and race the pair-code Connect/PairPhone, which
+	// WhatsApp rejects (intermittent first-attempt failure). Guarded by s.mu.
+	pairCodeInFlight bool
+
+	// qrDone is closed by the most recent connectWithQR goroutine when it
+	// fully exits (after its own cleanup). GeneratePairCode waits on this
+	// after cancelling the QR context so its fresh Connect runs against a
+	// torn-down websocket, not one the QR goroutine is still tearing down.
+	// Guarded by s.mu.
+	qrDone chan struct{}
 }
 
 func (s *session) phone() string {
@@ -448,14 +462,24 @@ func (m *Manager) GeneratePairCode(ctx context.Context, sessionID, phoneNumber s
 		}
 	}
 
-	// Cancel any running QR goroutine first.
+	// Claim the websocket for the pair-code flow and snapshot the current QR
+	// goroutine's done-channel under the same lock so we can wait on it.
+	// pairCodeInFlight blocks connectWithQR's auto-restart loop from spawning
+	// a new goroutine while we own the connection.
 	s.mu.Lock()
+	s.pairCodeInFlight = true
+	qrDone := s.qrDone
 	if s.cancelQR != nil {
 		slog.Debug("GeneratePairCode: canceling existing QR goroutine", "session", sessionID)
 		s.cancelQR()
 		s.cancelQR = nil
 	}
 	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.pairCodeInFlight = false
+		s.mu.Unlock()
+	}()
 
 	// Always disconnect and reconnect fresh for the pair-code flow.
 	//
@@ -467,7 +491,25 @@ func (m *Manager) GeneratePairCode(ctx context.Context, sessionID, phoneNumber s
 	// emitted before calling PairPhone, as required by WhatsMeow's pre-login flow.
 	slog.Info("GeneratePairCode: disconnecting for fresh pair-code flow", "session", sessionID)
 	s.client.Disconnect()
-	time.Sleep(500 * time.Millisecond) // let the QR goroutine fully exit
+
+	// Wait deterministically for the QR goroutine to exit before reconnecting.
+	// A fixed sleep here previously raced the goroutine on slow hosts (Cloud
+	// Run cold start) — the goroutine would still be tearing down its websocket
+	// when our Connect() ran, and WhatsApp rejected the pair as a stale-session
+	// 400.  Cap the wait so a hung goroutine cannot block the request entirely.
+	if qrDone != nil {
+		select {
+		case <-qrDone:
+			slog.Debug("GeneratePairCode: QR goroutine exited cleanly", "session", sessionID)
+		case <-time.After(3 * time.Second):
+			slog.Warn("GeneratePairCode: timed out waiting for QR goroutine to exit — proceeding",
+				"session", sessionID)
+		}
+	} else {
+		// No QR goroutine was registered for this session (e.g. paired-session
+		// path) — give the disconnect a brief moment to settle anyway.
+		time.Sleep(200 * time.Millisecond)
+	}
 
 	readyCh := make(chan error, 1)
 	handlerID := s.client.AddEventHandler(func(raw interface{}) {
@@ -653,12 +695,20 @@ func (m *Manager) LogoutSession(ctx context.Context, sessionID string) error {
 func (m *Manager) connectWithQR(s *session) {
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// Publish a qrDone channel for GeneratePairCode to wait on. It is closed
+	// only when this goroutine fully exits (after cleanup + the unpaired
+	// auto-restart sleep is skipped/honoured), so the pair-code flow can
+	// proceed against a stable client instead of racing this goroutine.
+	qrDone := make(chan struct{})
+	defer close(qrDone)
+
 	// Create a fresh readyCh so that GetQRPayload callers can block until the
 	// first QR payload is available.  Reset qrPayload to empty so that stale
 	// payloads from a previous QR session are never served.
 	readyCh := make(chan struct{})
 	s.mu.Lock()
 	s.cancelQR = cancel
+	s.qrDone = qrDone
 	s.mu.Unlock()
 	s.qrMu.Lock()
 	s.qrPayload = ""
@@ -764,10 +814,20 @@ func (m *Manager) connectWithQR(s *session) {
 	// If the session is still unpaired the QR timed out without being scanned.
 	// Auto-restart the QR flow after a brief pause so a fresh code is always
 	// available without requiring manual intervention from the Python backend.
-	if !s.paired() {
+	//
+	// Skip the auto-restart while GeneratePairCode holds the websocket — a
+	// parallel connectWithQR goroutine would race the pair-code Connect /
+	// PairPhone and WhatsApp would reject the pair, causing the visible
+	// first-attempt failure during onboarding.
+	s.mu.RLock()
+	pairInFlight := s.pairCodeInFlight
+	s.mu.RUnlock()
+	if !s.paired() && !pairInFlight {
 		slog.Info("QR session ended without pairing — scheduling QR restart in 2s", "session", s.id)
 		time.Sleep(2 * time.Second)
 		go m.connectWithQR(s)
+	} else if pairInFlight {
+		slog.Info("QR session ended — pair-code flow in flight, skipping auto-restart", "session", s.id)
 	}
 }
 
@@ -923,6 +983,20 @@ func (m *Manager) makeEventHandler(s *session) func(interface{}) {
 			s.setStatus(StatusConnected)
 			slog.Info("WhatsApp connected", "session", s.id)
 			m.tracker.TrackSessionConnected(s.id)
+			// One-shot privacy-token cache audit. Pure observability — the
+			// goroutine opens a read-only SQLite handle to the same file
+			// whatsmeow is writing to, computes a histogram of stored
+			// tokens by our_jid, and logs whether the current session can
+			// actually see any of them. Detects the re-pair-invalidation
+			// failure mode where all tokens are stranded under a previous
+			// device session ID and every cold send gets 463.
+			go func(sessionID string, dbDir string) {
+				ourJID := ""
+				if id := s.client.Store.ID; id != nil {
+					ourJID = id.String()
+				}
+				logTokenCacheHealth(context.Background(), sessionID, sessionDBPath(dbDir, sessionID), ourJID)
+			}(s.id, m.dbDir)
 
 		case *events.Disconnected:
 			s.setStatus(StatusDisconnected)
