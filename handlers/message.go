@@ -5,16 +5,125 @@ import (
 	"encoding/base64"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 
 	"whatsapp-bridge/client"
 	"whatsapp-bridge/utils"
 )
+
+// retryDelays defines the wait between SendMessage attempts when WhatsApp
+// returns the recoverable error 463 (NackCallerReachoutTimelocked).
+//
+// The first send to a cold contact has no stored privacy token, so whatsmeow's
+// send.go schedules an asynchronous issuePrivacyTokenAndSave call AFTER the
+// failed send. The IQ round-trip + server-side privacy_token notification
+// typically settles in 1–5 seconds, so a single short retry usually captures
+// any wins this mitigation can capture. Beyond that, additional retries do
+// not help — the server has decided.
+//
+// IMPORTANT: the total budget (sum of these delays + per-attempt send time)
+// MUST stay under the backend's httpx client timeout (currently 30s in
+// app/services/whatsmeow_client.py `_client(timeout=30.0)`). Otherwise the
+// backend cancels the request mid-retry, the bridge sees "context canceled",
+// the 429 mapping never fires, and the backend's _send treats it as a
+// generic crash instead of a typed reachout-timelocked failure. 7s × 1 retry
+// + ~2s of send time = ~9s — well inside the 30s budget.
+var retryDelays = []time.Duration{7 * time.Second}
+
+// isReachoutTimelocked reports whether the error returned by whatsmeow's
+// SendMessage corresponds to WhatsApp server error 463 (cold-contact
+// rate-limit on companion devices). The library surfaces this as the literal
+// string "server returned error 463" inside the wrapped error.
+func isReachoutTimelocked(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "server returned error 463")
+}
+
+// sendWithRetry calls wac.SendMessage and, on a 463, waits and retries up to
+// len(retryDelays) more times. Returns the SendResponse and the final error
+// (nil on success). The opTimeout caps each individual SendMessage attempt;
+// the wait between attempts is independent and uses a separate timer.
+//
+// Aborts retries early if the parent request context is cancelled — this
+// prevents the bridge from holding a closed HTTP connection open.
+func sendWithRetry(parentCtx context.Context, wac *whatsmeow.Client, jid types.JID, msg *waE2E.Message, opTimeout time.Duration, payloadType string) (whatsmeow.SendResponse, error) {
+	var resp whatsmeow.SendResponse
+	var lastErr error
+
+	maxAttempts := 1 + len(retryDelays)
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		sendCtx, cancel := context.WithTimeout(parentCtx, opTimeout)
+		var err error
+		resp, err = wac.SendMessage(sendCtx, jid, msg)
+		cancel()
+		if err == nil {
+			if attempt > 1 {
+				slog.Info("[bridge] SendMessage succeeded after retry",
+					"to", jid.String(),
+					"payload_type", payloadType,
+					"attempt", attempt,
+				)
+			}
+			return resp, nil
+		}
+		lastErr = err
+
+		if !isReachoutTimelocked(err) {
+			return resp, err
+		}
+
+		if attempt >= maxAttempts {
+			break
+		}
+
+		delay := retryDelays[attempt-1]
+		slog.Warn("[bridge] SendMessage 463 — scheduling retry",
+			"to", jid.String(),
+			"payload_type", payloadType,
+			"attempt", attempt,
+			"next_attempt_in", delay.String(),
+		)
+		select {
+		case <-time.After(delay):
+		case <-parentCtx.Done():
+			return resp, parentCtx.Err()
+		}
+	}
+	return resp, lastErr
+}
+
+// writeSendError writes a structured error response. For 463 (cold-contact
+// rate-limit) we return HTTP 429 so the backend can distinguish this from a
+// generic bridge crash. The Python backend should:
+//   - Not advance any state machine on 429 (the message did not get delivered)
+//   - Avoid an immediate user-visible retry — there's no fix that completes in
+//     seconds for this specific failure mode
+//   - Optionally schedule a delayed background retry (privacy tokens may be
+//     issued async after our retries, so a send 5–15 min later sometimes works)
+func writeSendError(c *gin.Context, payloadType string, jid types.JID, textLen int, err error) {
+	slog.Error("[bridge] SendMessage failed",
+		"to", jid.String(),
+		"payload_type", payloadType,
+		"text_len", textLen,
+		"error", err.Error(),
+	)
+	if isReachoutTimelocked(err) {
+		c.JSON(http.StatusTooManyRequests, gin.H{
+			"error":               "reachout_timelocked",
+			"code":                463,
+			"message":             "WhatsApp rejected the send (companion-device privacy gating). Recipient may not accept messages from this device yet.",
+			"retry_after_seconds": 300,
+		})
+		return
+	}
+	c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+}
 
 // sendMessageRequest covers text, audio, and image variants.
 type sendMessageRequest struct {
@@ -108,17 +217,9 @@ func handleText(c *gin.Context, wac *whatsmeow.Client, jidStr, text string, opTi
 	if msg.GetExtendedTextMessage() != nil {
 		payloadType = "extended_text"
 	}
-	ctx, cancel := context.WithTimeout(c.Request.Context(), opTimeout)
-	defer cancel()
-	resp, err := wac.SendMessage(ctx, jid, msg)
+	resp, err := sendWithRetry(c.Request.Context(), wac, jid, msg, opTimeout, payloadType)
 	if err != nil {
-		slog.Error("[bridge] SendMessage failed",
-			"to", jid.String(),
-			"payload_type", payloadType,
-			"text_len", len(text),
-			"error", err.Error(),
-		)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		writeSendError(c, payloadType, jid, len(text), err)
 		return
 	}
 	slog.Info("[bridge] SendMessage ok",
@@ -181,11 +282,9 @@ func handleAudio(c *gin.Context, wac *whatsmeow.Client, jidStr string, req sendM
 	}
 
 	jid, _ := client.ParsePhone(jidStr)
-	sendCtx, sendCancel := context.WithTimeout(c.Request.Context(), opTimeout)
-	defer sendCancel()
-	resp, err := wac.SendMessage(sendCtx, jid, audioMsg)
+	resp, err := sendWithRetry(c.Request.Context(), wac, jid, audioMsg, opTimeout, "audio")
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		writeSendError(c, "audio", jid, 0, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "sent", "message_id": resp.ID})
@@ -236,11 +335,9 @@ func handleImage(c *gin.Context, wac *whatsmeow.Client, jidStr string, req sendM
 	}
 
 	jid, _ := client.ParsePhone(jidStr)
-	sendCtx, sendCancel := context.WithTimeout(c.Request.Context(), opTimeout)
-	defer sendCancel()
-	resp, err := wac.SendMessage(sendCtx, jid, imageMsg)
+	resp, err := sendWithRetry(c.Request.Context(), wac, jid, imageMsg, opTimeout, "image")
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		writeSendError(c, "image", jid, len(caption), err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "sent", "message_id": resp.ID})
