@@ -1241,6 +1241,25 @@ func (m *Manager) handleIncoming(s *session, evt *events.Message) {
 		"is_group", info.IsGroup,
 	)
 
+	// ── Guard 0: offline-queue replay suppression ─────────────────────────────
+	// Runs BEFORE the owner-echo forwarding below. On reconnect WhatsApp
+	// replays messages (inbound AND our own outbound) that were queued while
+	// the bridge was down. A replayed owner-typed message would otherwise be
+	// forwarded as event=owner_message and trigger a spurious 90-minute AI
+	// pause hours after the owner actually sent it.
+	const replayGrace = 30 * time.Second
+	if info.Timestamp.Before(bridgeStartTime.Add(-replayGrace)) {
+		slog.Info("[bridge] skipping offline-replay message (pre-startup)",
+			"session", s.id,
+			"id", info.ID,
+			"from", info.Sender.String(),
+			"is_from_me", info.IsFromMe,
+			"age", time.Since(info.Timestamp).Round(time.Second),
+		)
+		m.tracker.TrackMessageTypeFiltered(s.id, info.Chat.User, "offline_replay")
+		return
+	}
+
 	// ── Guard 1: outbound-echo handling (is_from_me=true) ────────────────────
 	// When we call SendMessage() the WhatsApp server echoes it back as an
 	// events.Message with IsFromMe=true. There are two sources:
@@ -1292,23 +1311,8 @@ func (m *Manager) handleIncoming(s *session, evt *events.Message) {
 		return
 	}
 
-	// ── Guard 2: offline-queue replay suppression ────────────────────────────
-	// On reconnect WhatsApp replays messages that arrived while the bridge was
-	// down.  The Python dedup cache is in-memory and empty after restart, so
-	// without this guard every replayed message would be reprocessed.
-	// Grace window: 30 s before bridge start so messages arriving just before
-	// a restart are still processed.
-	const replayGrace = 30 * time.Second
-	if info.Timestamp.Before(bridgeStartTime.Add(-replayGrace)) {
-		slog.Info("[bridge] skipping offline-replay message (pre-startup)",
-			"session", s.id,
-			"id", info.ID,
-			"from", info.Sender.String(),
-			"age", time.Since(info.Timestamp).Round(time.Second),
-		)
-		m.tracker.TrackMessageTypeFiltered(s.id, info.Chat.User, "offline_replay")
-		return
-	}
+	// (Offline-queue replay suppression now runs as Guard 0 above, before the
+	// owner-echo forwarding, so replayed owner messages are filtered too.)
 
 	// Dispatch the heavy work (LID server-roundtrip, media download, webhook)
 	// to a goroutine so whatsmeow's event loop is not blocked.  The guards

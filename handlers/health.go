@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -30,52 +29,8 @@ func Health(c *gin.Context) {
 	})
 }
 
-// DebugEnv handles GET /api/debug/env
-// Returns all environment variables and .env file contents for testing/debugging.
-// WARNING: This exposes all secrets and credentials — use only in development!
-func DebugEnv(c *gin.Context) {
-	slog.Warn("DebugEnv endpoint called — exposing all environment variables",
-		"remote_ip", c.RemoteIP(),
-		"user_agent", c.Request.UserAgent(),
-	)
-
-	envVars := make(map[string]string)
-	for _, env := range os.Environ() {
-		parts := strings.SplitN(env, "=", 2)
-		if len(parts) == 2 {
-			envVars[parts[0]] = parts[1]
-		}
-	}
-
-	// Try to read .env file from current working directory
-	envFileContent := "-- .env file not found or not readable --"
-	envFilePath := ".env"
-	if data, err := os.ReadFile(envFilePath); err == nil {
-		envFileContent = string(data)
-	} else {
-		slog.Debug("DebugEnv: could not read .env file",
-			"path", envFilePath,
-			"error", err,
-		)
-		// Try alternative paths
-		for _, altPath := range []string{"/app/.env", "/root/.env", "/home/.env"} {
-			if data, err := os.ReadFile(altPath); err == nil {
-				envFileContent = string(data)
-				envFilePath = altPath
-				break
-			}
-		}
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"warning":          "SECURITY: This endpoint exposes all secrets and credentials",
-		"environment_vars": envVars,
-		"env_file_path":    envFilePath,
-		"env_file_content": envFileContent,
-		"request_info": gin.H{
-			"remote_ip":  c.RemoteIP(),
-			"user_agent": c.Request.UserAgent(),
-			"timestamp":  c.GetString("timestamp"),
-		},
-	})
-}
+// NOTE: the former GET /api/debug/env endpoint was removed. It returned every
+// environment variable and the raw .env file over an UNAUTHENTICATED route —
+// bridge credentials, webhook secret, and API keys included. Never reintroduce
+// an endpoint like that; use `gcloud run services describe` / host shell access
+// to inspect production configuration instead.

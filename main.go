@@ -93,7 +93,6 @@ func main() {
 
 	// Health check — no auth required.
 	router.GET("/api/health", handlers.Health)
-	router.GET("/api/debug/env", handlers.DebugEnv)
 
 	// All other routes require Basic-Auth.
 	auth := middleware.BasicAuth(cfg.BridgeUsername, cfg.BridgePassword)

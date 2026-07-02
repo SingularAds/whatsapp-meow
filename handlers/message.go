@@ -260,10 +260,11 @@ func handleAudio(c *gin.Context, wac *whatsmeow.Client, jidStr string, req sendM
 
 	duration := utils.ExtractOGGDuration(audioBytes)
 
-	mimeType := req.Audio.MimeType
-	if mimeType == "" {
-		mimeType = "audio/ogg; codecs=opus"
-	}
+	// The bytes were just transcoded to OGG/Opus above, so the message must be
+	// stamped with that mimetype regardless of what the caller supplied —
+	// honouring a client-provided "audio/mpeg" here would mislabel the opus
+	// payload and break playback on some clients.
+	mimeType := "audio/ogg; codecs=opus"
 
 	audioMsg := &waE2E.Message{
 		AudioMessage: &waE2E.AudioMessage{
