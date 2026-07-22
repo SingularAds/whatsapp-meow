@@ -11,7 +11,7 @@
 #
 # Required env vars:
 #   GCS_BACKUP_BUCKET   — GCS bucket name (no gs:// prefix), e.g. "whatsapp-bridge-sessions-504457548316"
-#   DEFAULT_SESSION_ID  — session to restore, e.g. "smba"
+#   DEFAULT_SESSION_ID  — the default session, e.g. "smba" (restore fallback only)
 #   DB_DIR              — local path, e.g. "/data/whatsapp"  (default: /data/whatsapp)
 #   BACKUP_INTERVAL     — seconds between periodic hot backups (default: 120)
 #
@@ -19,10 +19,18 @@
 # No extra tools needed — uses the GCS JSON REST API + the metadata server token.
 #
 # Session-persistence guarantees:
-#   1. Startup:  restore .db + .db-wal + .db-shm from GCS (SQLite auto-applies WAL on open).
-#   2. Shutdown: stop bridge first (lets SQLite checkpoint WAL), then upload all three files.
+#   1. Startup:  restore EVERY session's .db + .db-wal + .db-shm from GCS
+#      (SQLite auto-applies WAL on open).
+#   2. Shutdown: stop bridge first (lets SQLite checkpoint WAL), then upload them all.
 #   3. Periodic: hot-backup every BACKUP_INTERVAL seconds so a SIGKILL loses at most
 #      that many seconds of session/message data instead of everything since last restart.
+#
+# MULTI-SESSION (fixed 2026-07-22): this script used to back up and restore ONLY
+# "${DEFAULT_SESSION_ID}.db". Every other session — additional global onboarding
+# numbers (smbb, …), the demo number, and every paired business (biz-<number>) —
+# lived only on Cloud Run's EPHEMERAL container disk and was therefore silently
+# destroyed by each redeploy/restart, unlinking those numbers with no error
+# anywhere. It now persists every *.db in DB_DIR.
 
 set -e
 
@@ -90,6 +98,32 @@ _gcs_download() {
     fi
 }
 
+# _gcs_list prints every object name in the bucket, one per line.
+# Used to discover ALL session DBs at startup (we cannot know the session ids in
+# advance — businesses pair at runtime as biz-<number>).
+_gcs_list() {
+    local bucket="$1" token payload page_token url
+    token=$(_gcs_token) || return 1
+    page_token=""
+    while : ; do
+        url="https://storage.googleapis.com/storage/v1/b/${bucket}/o?fields=items(name),nextPageToken&maxResults=1000"
+        [ -n "$page_token" ] && url="${url}&pageToken=${page_token}"
+        payload=$(curl -sS \
+            --connect-timeout "${_CURL_CONNECT_TIMEOUT}" \
+            --max-time "${_CURL_MAX_TIME}" \
+            --retry 3 \
+            --retry-delay 1 \
+            -H "Authorization: Bearer ${token}" \
+            "$url" 2>/dev/null) || return 1
+        # One "name": "..." per line.
+        printf '%s' "$payload" | tr ',' '\n' \
+            | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+        page_token=$(printf '%s' "$payload" \
+            | sed -n 's/.*"nextPageToken"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        [ -n "$page_token" ] || break
+    done
+}
+
 # _gcs_upload_multi fetches a single token and uploads multiple files in one shot.
 # Usage: _gcs_upload_multi bucket object1 src1 [object2 src2 ...]
 _gcs_upload_multi() {
@@ -134,45 +168,87 @@ _gcs_upload_multi() {
 
 # ── startup restore ───────────────────────────────────────────────────────────
 
-if [ -n "$_BUCKET" ] && [ -n "$_SESSION" ]; then
+# Restore ONE session (main DB + WAL/SHM sidecars). Returns 0 if the main DB came
+# down, 1 otherwise (sidecar failures are never fatal — they may not exist).
+_restore_session() {
+    local base="$1"
+    if _gcs_download "$_BUCKET" "${base}.db" "${_DB_DIR}/${base}.db"; then
+        echo "[entrypoint] Restored ${base}.db ($(wc -c < "${_DB_DIR}/${base}.db") bytes)"
+        _gcs_download "$_BUCKET" "${base}.db-wal" "${_DB_DIR}/${base}.db-wal" || true
+        _gcs_download "$_BUCKET" "${base}.db-shm" "${_DB_DIR}/${base}.db-shm" || true
+        return 0
+    fi
+    return 1
+}
+
+if [ -n "$_BUCKET" ]; then
     mkdir -p "$_DB_DIR"
 
-    echo "[entrypoint] Attempting to restore ${_SESSION}.db from gs://${_BUCKET}/"
+    echo "[entrypoint] Restoring ALL session DBs from gs://${_BUCKET}/"
+    _restored=0
+    _objects=$(_gcs_list "$_BUCKET") || _objects=""
 
-    # Main DB file
-    if _gcs_download "$_BUCKET" "${_SESSION}.db" "${_DB_DIR}/${_SESSION}.db"; then
-        echo "[entrypoint] Restored ${_SESSION}.db ($(wc -c < "${_DB_DIR}/${_SESSION}.db") bytes)"
+    if [ -n "$_objects" ]; then
+        # Iterate main .db objects only; sidecars are pulled by _restore_session.
+        for _obj in $_objects; do
+            case "$_obj" in
+                *.db) ;;
+                *) continue ;;
+            esac
+            _base="${_obj%.db}"
+            if _restore_session "$_base"; then
+                _restored=$((_restored + 1))
+            fi
+        done
+        echo "[entrypoint] Restored ${_restored} session DB(s)"
     else
-        echo "[entrypoint] No existing DB in GCS — starting fresh (first run or after explicit wipe)"
+        # Listing failed (permissions/network) or the bucket is empty. Fall back to
+        # the single default session so this can never be WORSE than the old
+        # behaviour, and say so loudly — a silent fallback is how sessions got lost.
+        echo "[entrypoint] WARNING: could not list gs://${_BUCKET}/ — falling back to ${_SESSION:-<unset>} only"
+        if [ -n "$_SESSION" ]; then
+            _restore_session "$_SESSION" \
+                || echo "[entrypoint] No existing DB in GCS — starting fresh (first run or after explicit wipe)"
+        fi
     fi
-
-    # WAL and SHM sidecar files (may not exist — ignore failures)
-    _gcs_download "$_BUCKET" "${_SESSION}.db-wal" "${_DB_DIR}/${_SESSION}.db-wal" || true
-    _gcs_download "$_BUCKET" "${_SESSION}.db-shm" "${_DB_DIR}/${_SESSION}.db-shm" || true
 else
-    echo "[entrypoint] GCS_BACKUP_BUCKET or DEFAULT_SESSION_ID not set — skipping GCS restore"
+    echo "[entrypoint] GCS_BACKUP_BUCKET not set — skipping GCS restore"
 fi
 
 # ── upload helper: back up main DB + WAL + SHM to GCS ────────────────────────
 
 _upload_db() {
-    if [ -z "$_BUCKET" ] || [ -z "$_SESSION" ]; then
+    if [ -z "$_BUCKET" ]; then
         return 0
     fi
-    local db="${_DB_DIR}/${_SESSION}.db"
-    [ -f "$db" ] || return 1
 
-    local wal="${db}-wal" shm="${db}-shm"
+    # Every session the bridge currently holds — the default global number, any
+    # additional global numbers, the demo line, and each paired business. Missing
+    # WAL/SHM sidecars are skipped inside _gcs_upload_multi.
+    local db base count names
+    count=0
+    names=""
+    set --
+    for db in "${_DB_DIR}"/*.db; do
+        [ -f "$db" ] || continue          # no matches → literal glob, skip
+        base="${db##*/}"; base="${base%.db}"
+        # SQLite uses .db + .db-wal together to reconstruct the full committed
+        # state on the next open, so they must be uploaded in sync.
+        set -- "$@" \
+            "${base}.db"     "$db" \
+            "${base}.db-wal" "${db}-wal" \
+            "${base}.db-shm" "${db}-shm"
+        count=$((count + 1))
+        names="${names} ${base}"
+    done
 
-    # Upload main DB plus any WAL/SHM files with a single metadata-server token.
-    # SQLite uses .db + .db-wal together to reconstruct the full committed state
-    # on the next open, so they must be kept in sync.
-    _gcs_upload_multi "$_BUCKET" \
-        "${_SESSION}.db"     "$db" \
-        "${_SESSION}.db-wal" "$wal" \
-        "${_SESSION}.db-shm" "$shm"
+    if [ "$count" -eq 0 ]; then
+        return 1
+    fi
 
-    echo "[entrypoint] Uploaded ${_SESSION}.db ($(wc -c < "$db") bytes)"
+    # One metadata-server token for the whole batch.
+    _gcs_upload_multi "$_BUCKET" "$@"
+    echo "[entrypoint] Uploaded ${count} session DB(s):${names}"
     return 0
 }
 
@@ -186,9 +262,9 @@ _periodic_backup() {
         sleep "${_BACKUP_INTERVAL}"
         # Exit loop if bridge process no longer exists.
         kill -0 "${_PID}" 2>/dev/null || break
-        if [ -n "$_BUCKET" ] && [ -n "$_SESSION" ] && [ -f "${_DB_DIR}/${_SESSION}.db" ]; then
-            echo "[entrypoint] Periodic backup of ${_SESSION}.db"
-            _upload_db || true
+        if [ -n "$_BUCKET" ]; then
+            echo "[entrypoint] Periodic backup of all session DBs"
+            _upload_db || true      # no-op when no session DB exists yet
         fi
     done
 }
@@ -231,7 +307,7 @@ echo "[entrypoint] Starting whatsapp-bridge (session=${_SESSION:-unset} db_dir=$
 _PID=$!
 
 # Start periodic hot-backup in the background (safety net against SIGKILL).
-if [ -n "$_BUCKET" ] && [ -n "$_SESSION" ]; then
+if [ -n "$_BUCKET" ]; then
     _periodic_backup &
     _BACKUP_PID=$!
 fi
