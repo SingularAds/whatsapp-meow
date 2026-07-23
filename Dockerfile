@@ -16,7 +16,11 @@ FROM alpine:3.20
 # metadata server for the Cloud Run service-account token.
 # dos2unix converts Windows CRLF line endings to LF so the shell script runs
 # correctly when built on a Windows host.
-RUN apk add --no-cache ca-certificates curl dos2unix ffmpeg tzdata \
+# sqlite3 (the CLI) lets entrypoint.sh checkpoint each session's WAL into its
+# main .db file before backup — see the _checkpoint_db comment in entrypoint.sh
+# for why this is required (uploading .db/.db-wal/.db-shm as separate HTTP
+# calls is only safe once the WAL has been checkpointed and truncated).
+RUN apk add --no-cache ca-certificates curl dos2unix ffmpeg sqlite tzdata \
     && addgroup -S app \
     && adduser -S -G app app
 

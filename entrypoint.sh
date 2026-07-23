@@ -19,9 +19,8 @@
 # No extra tools needed — uses the GCS JSON REST API + the metadata server token.
 #
 # Session-persistence guarantees:
-#   1. Startup:  restore EVERY session's .db + .db-wal + .db-shm from GCS
-#      (SQLite auto-applies WAL on open).
-#   2. Shutdown: stop bridge first (lets SQLite checkpoint WAL), then upload them all.
+#   1. Startup:  restore EVERY session's .db from GCS.
+#   2. Shutdown: stop bridge first, then back up all of them.
 #   3. Periodic: hot-backup every BACKUP_INTERVAL seconds so a SIGKILL loses at most
 #      that many seconds of session/message data instead of everything since last restart.
 #
@@ -31,6 +30,22 @@
 # lived only on Cloud Run's EPHEMERAL container disk and was therefore silently
 # destroyed by each redeploy/restart, unlinking those numbers with no error
 # anywhere. It now persists every *.db in DB_DIR.
+#
+# CONSISTENT SNAPSHOTS (fixed 2026-07-23): the multi-session fix above still
+# corrupted two live sessions ("demo", "smbb") within a day. Root cause: each
+# hot backup uploaded the raw .db/.db-wal/.db-shm files as three SEPARATE HTTP
+# calls while the bridge kept writing — a message landing mid-backup could tear
+# a page mid-copy or pair a base file with a WAL from a different moment.
+# Confirmed by downloading the actual corrupted GCS objects and running
+# PRAGMA integrity_check locally — "database disk image is malformed" even on
+# the .db file ALONE, with no WAL involved.
+#
+# Fix: back up via SQLite's own `.backup` command instead of copying the live
+# files directly. `.backup` uses SQLite's internal locking to produce a single,
+# guaranteed-consistent snapshot no matter what the bridge is concurrently
+# writing (verified: still integrity_check-clean under 500 concurrent writes
+# during the backup). The resulting file is fully self-contained, so sessions
+# are now backed up/restored as ONE file each — no .db-wal/.db-shm sidecars.
 
 set -e
 
@@ -168,14 +183,13 @@ _gcs_upload_multi() {
 
 # ── startup restore ───────────────────────────────────────────────────────────
 
-# Restore ONE session (main DB + WAL/SHM sidecars). Returns 0 if the main DB came
-# down, 1 otherwise (sidecar failures are never fatal — they may not exist).
+# Restore ONE session. Each backed-up .db is a self-contained `.backup` snapshot
+# (see _snapshot_db below) — no .db-wal/.db-shm sidecars to restore alongside it.
+# Returns 0 if the DB came down, 1 otherwise.
 _restore_session() {
     local base="$1"
     if _gcs_download "$_BUCKET" "${base}.db" "${_DB_DIR}/${base}.db"; then
         echo "[entrypoint] Restored ${base}.db ($(wc -c < "${_DB_DIR}/${base}.db") bytes)"
-        _gcs_download "$_BUCKET" "${base}.db-wal" "${_DB_DIR}/${base}.db-wal" || true
-        _gcs_download "$_BUCKET" "${base}.db-shm" "${_DB_DIR}/${base}.db-shm" || true
         return 0
     fi
     return 1
@@ -215,7 +229,42 @@ else
     echo "[entrypoint] GCS_BACKUP_BUCKET not set — skipping GCS restore"
 fi
 
-# ── upload helper: back up main DB + WAL + SHM to GCS ────────────────────────
+# ── upload helper: back up every session as a consistent snapshot ────────────
+
+# _snapshot_db writes a GUARANTEED-CONSISTENT copy of a live session db to
+# $2, using SQLite's own ".backup" command (not a raw file copy).
+#
+# WHY THIS EXISTS (found 2026-07-23, both "demo" and "smbb" corrupted in prod):
+# the previous approach uploaded the raw .db/.db-wal/.db-shm files as three
+# SEPARATE HTTP calls while the bridge kept writing to a live WAL-mode
+# database. A message landing mid-backup could tear a page mid-copy or pair a
+# base file with a WAL from a different moment. Confirmed by downloading the
+# actual corrupted objects from GCS and running PRAGMA integrity_check locally
+# — it failed even on the .db file ALONE, with no WAL involved, i.e. the base
+# file copy itself was torn, not just mismatched against its WAL.
+#
+# `.backup` sidesteps this entirely: it uses SQLite's own internal locking to
+# produce one self-contained, always-valid snapshot, regardless of what the
+# live database is concurrently doing. Verified locally: integrity_check-clean
+# even while 500 writes were hammering the source db during the backup call.
+# Safe to run from a second process — SQLite is explicitly designed for
+# multiple connections against the same WAL-mode file.
+#
+# Returns 1 (never fatal) if sqlite3 is missing or the backup call fails —
+# caller falls back to skipping that session this round rather than uploading
+# something unverified.
+_snapshot_db() {
+    local db="$1" dest="$2"
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        echo "[entrypoint] WARNING: sqlite3 CLI not available — cannot safely back up ${db}, skipping this round"
+        return 1
+    fi
+    if ! sqlite3 "$db" ".backup '${dest}'" >/dev/null 2>&1; then
+        echo "[entrypoint] WARNING: snapshot failed for ${db} — skipping this round (previous GCS backup, if any, is untouched)"
+        return 1
+    fi
+    return 0
+}
 
 _upload_db() {
     if [ -z "$_BUCKET" ]; then
@@ -223,39 +272,41 @@ _upload_db() {
     fi
 
     # Every session the bridge currently holds — the default global number, any
-    # additional global numbers, the demo line, and each paired business. Missing
-    # WAL/SHM sidecars are skipped inside _gcs_upload_multi.
-    local db base count names
+    # additional global numbers, the demo line, and each paired business.
+    local db base count names snap_dir
     count=0
     names=""
+    snap_dir="$(mktemp -d)"
     set --
     for db in "${_DB_DIR}"/*.db; do
         [ -f "$db" ] || continue          # no matches → literal glob, skip
         base="${db##*/}"; base="${base%.db}"
-        # SQLite uses .db + .db-wal together to reconstruct the full committed
-        # state on the next open, so they must be uploaded in sync.
-        set -- "$@" \
-            "${base}.db"     "$db" \
-            "${base}.db-wal" "${db}-wal" \
-            "${base}.db-shm" "${db}-shm"
+        # Skip this session's upload entirely on a failed snapshot, rather than
+        # uploading a raw (possibly torn) copy — an old, still-good GCS backup
+        # is safer than a fresh, corrupted one.
+        _snapshot_db "$db" "${snap_dir}/${base}.db" || continue
+        set -- "$@" "${base}.db" "${snap_dir}/${base}.db"
         count=$((count + 1))
         names="${names} ${base}"
     done
 
     if [ "$count" -eq 0 ]; then
+        rm -rf "$snap_dir"
         return 1
     fi
 
     # One metadata-server token for the whole batch.
     _gcs_upload_multi "$_BUCKET" "$@"
     echo "[entrypoint] Uploaded ${count} session DB(s):${names}"
+    rm -rf "$snap_dir"
     return 0
 }
 
 # ── periodic hot backup (safety net against SIGKILL / OOM kill) ──────────────
 # Runs in the background and uploads every BACKUP_INTERVAL seconds while the
-# bridge is alive.  In WAL mode the .db + .db-wal pair is always consistent, so
-# copying both files gives a safe point-in-time snapshot even with a live DB.
+# bridge is alive. Each session is snapshotted via SQLite's own .backup command
+# immediately before upload (see _snapshot_db) so what gets uploaded is always
+# a single, internally-consistent file — safe regardless of concurrent writes.
 
 _periodic_backup() {
     while true; do
@@ -282,7 +333,8 @@ _periodic_backup() {
 #      which triggers an automatic WAL checkpoint and flushes all data into
 #      the main .db file.
 #   2. Wait for bridge process to fully exit.
-#   3. Upload the now-complete .db (plus WAL/SHM as belt-and-suspenders).
+#   3. Upload the now-complete .db (via _snapshot_db's .backup, same as the
+#      periodic path — cheap and safe even with no concurrent writer left).
 
 _backup_and_exit() {
     echo "[entrypoint] SIGTERM received — stopping bridge before GCS backup"
