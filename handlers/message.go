@@ -125,14 +125,16 @@ func writeSendError(c *gin.Context, payloadType string, jid types.JID, textLen i
 	c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 }
 
-// sendMessageRequest covers text, audio, and image variants.
+// sendMessageRequest covers text, audio, image, and video variants.
 type sendMessageRequest struct {
 	Phone   string      `json:"phone"`
-	Message string      `json:"message"`     // text variant
-	Type    string      `json:"type"`        // "audio" | "image" | empty = text
-	Audio   *audioField `json:"audio"`       // audio variant
-	Image   *imageField `json:"image"`       // image variant
-	PTT     bool        `json:"ptt"`         // true → voice-note bubble (audio only)
+	Message string      `json:"message"` // text variant
+	Type    string      `json:"type"`    // "audio" | "image" | "video" | empty = text
+	Audio   *audioField `json:"audio"`   // audio variant
+	Image   *imageField `json:"image"`   // image variant
+	Video   *videoField `json:"video"`   // video variant
+	PTT     bool        `json:"ptt"`     // true → voice-note bubble (audio only)
+	PTV     bool        `json:"ptv"`     // true → round video-note bubble (video only)
 }
 
 type audioField struct {
@@ -144,6 +146,15 @@ type imageField struct {
 	Data     string `json:"data"`     // base64-encoded image bytes (PNG or JPEG)
 	MimeType string `json:"mimetype"` // e.g. "image/png" or "image/jpeg"
 	Caption  string `json:"caption"`  // optional caption text
+}
+
+type videoField struct {
+	Data     string `json:"data"`     // base64-encoded video bytes (MP4/H.264)
+	MimeType string `json:"mimetype"` // e.g. "video/mp4"
+	Caption  string `json:"caption"`  // optional caption (ignored for round PTV notes)
+	Seconds  uint32 `json:"seconds"`  // optional duration hint
+	Width    uint32 `json:"width"`    // optional pixel width
+	Height   uint32 `json:"height"`   // optional pixel height
 }
 
 // SendMessageHandler handles POST /send/message for BOTH text and audio.
@@ -198,6 +209,11 @@ func SendMessageHandler(mgr *client.Manager, opTimeout time.Duration) gin.Handle
 
 		if req.Type == "image" {
 			handleImage(c, wac, jid.String(), req, opTimeout)
+			return
+		}
+
+		if req.Type == "video" {
+			handleVideo(c, wac, jid.String(), req, opTimeout)
 			return
 		}
 
@@ -343,3 +359,81 @@ func handleImage(c *gin.Context, wac *whatsmeow.Client, jidStr string, req sendM
 	c.JSON(http.StatusOK, gin.H{"status": "sent", "message_id": resp.ID})
 }
 
+// handleVideo sends an MP4 video. When req.PTV is true it is delivered as a
+// WhatsApp "video note" — the round, tap-to-play bubble (proto PtvMessage) —
+// which WhatsApp only renders correctly for SHORT (≤60s), SQUARE clips. When
+// false it is a normal VideoMessage (with optional caption). The bytes must be
+// a base64-encoded, already-WhatsApp-compatible MP4 (H.264/AAC); the bridge does
+// NOT transcode video, so the caller is responsible for format.
+func handleVideo(c *gin.Context, wac *whatsmeow.Client, jidStr string, req sendMessageRequest, opTimeout time.Duration) {
+	if req.Video == nil || req.Video.Data == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "video.data is required for type=video"})
+		return
+	}
+
+	vidBytes, err := base64.StdEncoding.DecodeString(req.Video.Data)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "video.data is not valid base64"})
+		return
+	}
+
+	// Upload to the WhatsApp CDN.
+	uploadCtx, uploadCancel := context.WithTimeout(c.Request.Context(), opTimeout)
+	defer uploadCancel()
+	uploaded, err := wac.Upload(uploadCtx, vidBytes, whatsmeow.MediaVideo)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "video upload failed: " + err.Error()})
+		return
+	}
+
+	mimeType := req.Video.MimeType
+	if mimeType == "" {
+		mimeType = "video/mp4"
+	}
+
+	vm := &waE2E.VideoMessage{
+		URL:               proto.String(uploaded.URL),
+		DirectPath:        proto.String(uploaded.DirectPath),
+		MediaKey:          uploaded.MediaKey,
+		FileEncSHA256:     uploaded.FileEncSHA256,
+		FileSHA256:        uploaded.FileSHA256,
+		FileLength:        proto.Uint64(uint64(len(vidBytes))),
+		Mimetype:          proto.String(mimeType),
+		MediaKeyTimestamp: proto.Int64(time.Now().Unix()),
+	}
+	if req.Video.Seconds > 0 {
+		vm.Seconds = proto.Uint32(req.Video.Seconds)
+	}
+	if req.Video.Width > 0 {
+		vm.Width = proto.Uint32(req.Video.Width)
+	}
+	if req.Video.Height > 0 {
+		vm.Height = proto.Uint32(req.Video.Height)
+	}
+
+	var msg *waE2E.Message
+	payloadType := "video"
+	if req.PTV {
+		// Round video note. PTV bubbles never show a caption, so it is dropped.
+		payloadType = "ptv"
+		msg = &waE2E.Message{PtvMessage: vm}
+	} else {
+		if req.Video.Caption != "" {
+			vm.Caption = proto.String(req.Video.Caption)
+		}
+		msg = &waE2E.Message{VideoMessage: vm}
+	}
+
+	jid, _ := client.ParsePhone(jidStr)
+	resp, err := sendWithRetry(c.Request.Context(), wac, jid, msg, opTimeout, payloadType)
+	if err != nil {
+		writeSendError(c, payloadType, jid, len(req.Video.Caption), err)
+		return
+	}
+	slog.Info("[bridge] SendMessage ok",
+		"to", jid.String(),
+		"payload_type", payloadType,
+		"message_id", resp.ID,
+	)
+	c.JSON(http.StatusOK, gin.H{"status": "sent", "message_id": resp.ID})
+}
