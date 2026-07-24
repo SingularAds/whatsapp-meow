@@ -1420,6 +1420,21 @@ func (m *Manager) handleIncoming(s *session, evt *events.Message) {
 			}
 		}
 
+		// Click-to-WhatsApp ad referral (Meta/Instagram "Send message" ad),
+		// present only on the prospect's first ad-sourced message. Forwarded so
+		// the backend attributes the onboarding to the ad instead of "organic".
+		referral := extractReferral(evt.Message)
+		if referral != nil {
+			slog.Info("[bridge] CTWA ad referral on inbound message",
+				"session", s.id,
+				"chat", chatID,
+				"msg_id", info.ID,
+				"source_id", referral.SourceID,
+				"source_url", referral.SourceURL,
+				"ctwa_clid", referral.CtwaClid,
+			)
+		}
+
 		payload := webhook.Event{
 			Event:    "message",
 			DeviceID: s.id,
@@ -1437,6 +1452,7 @@ func (m *Manager) handleIncoming(s *session, evt *events.Message) {
 				MessageType: msgType,
 				MediaURL:    mediaURL,
 				MimeType:    mimeType,
+				Referral:    referral,
 			},
 		}
 
@@ -1607,6 +1623,56 @@ func classifyMessage(s *session, m *Manager, evt *events.Message) (msgType, body
 	}
 
 	return "", "", "", ""
+}
+
+// messageContextInfo returns the ContextInfo of whichever message variant
+// carries one. Only the rich types expose it (plain Conversation text does
+// not) — a Click-to-WhatsApp ad's prefilled first message arrives as an
+// ExtendedTextMessage, while image/video ad formats carry it on their own
+// message. Returns nil when the message has no context.
+func messageContextInfo(msg *waE2E.Message) *waE2E.ContextInfo {
+	if msg == nil {
+		return nil
+	}
+	if ext := msg.GetExtendedTextMessage(); ext != nil {
+		return ext.GetContextInfo()
+	}
+	if img := msg.GetImageMessage(); img != nil {
+		return img.GetContextInfo()
+	}
+	if vid := msg.GetVideoMessage(); vid != nil {
+		return vid.GetContextInfo()
+	}
+	return nil
+}
+
+// extractReferral pulls Click-to-WhatsApp ad-referral metadata off an inbound
+// message, or returns nil when the message did not originate from an ad. Meta
+// attaches this (ExternalAdReply) only to the FIRST message after an ad tap,
+// so this naturally fires once per ad-sourced prospect. The mapped fields feed
+// the backend's attribution model (meta_ads channel + ad id / click id).
+func extractReferral(msg *waE2E.Message) *webhook.ReferralInfo {
+	ctx := messageContextInfo(msg)
+	if ctx == nil {
+		return nil
+	}
+	ad := ctx.GetExternalAdReply()
+	if ad == nil {
+		return nil
+	}
+	// Require at least one identifying signal so an empty/degenerate
+	// ExternalAdReply never manufactures a bogus "ad" attribution.
+	if ad.GetSourceID() == "" && ad.GetSourceURL() == "" && ad.GetCtwaClid() == "" {
+		return nil
+	}
+	return &webhook.ReferralInfo{
+		SourceID:   ad.GetSourceID(),
+		SourceURL:  ad.GetSourceURL(),
+		SourceType: ad.GetSourceType(),
+		CtwaClid:   ad.GetCtwaClid(),
+		Title:      ad.GetTitle(),
+		Body:       ad.GetBody(),
+	}
 }
 
 // downloadMedia downloads, saves, and returns (mediaURL, mimeType).

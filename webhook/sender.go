@@ -12,20 +12,39 @@ import (
 	"whatsapp-bridge/analytics"
 )
 
+// ReferralInfo carries Click-to-WhatsApp (CTWA) ad-referral metadata that
+// WhatsApp attaches to the FIRST message a prospect sends after tapping a
+// Meta/Instagram "Send message" ad. The bridge forwards it verbatim; the
+// backend (app/services/attribution.py) maps it to the meta_ads channel.
+//
+// Field names match exactly what the backend's build_attribution reads
+// (source_id / source_url / source_type / ctwa_clid / title / body), so the
+// same object works whether it originated here or from the official Cloud API.
+// Present only on ad-sourced first contacts — omitted entirely otherwise.
+type ReferralInfo struct {
+	SourceID   string `json:"source_id,omitempty"`   // Meta ad id
+	SourceURL  string `json:"source_url,omitempty"`  // fb.me / instagram.com deep link — decides FB vs IG
+	SourceType string `json:"source_type,omitempty"` // "ad" (may also be "post")
+	CtwaClid   string `json:"ctwa_clid,omitempty"`   // click id, for Meta conversion reconciliation
+	Title      string `json:"title,omitempty"`       // ad headline
+	Body       string `json:"body,omitempty"`        // ad body text
+}
+
 // MessagePayload mirrors the payload object that FastAPI expects.
 type MessagePayload struct {
-	ChatID      string `json:"chat_id"`
-	From        string `json:"from"`      // sender's full JID e.g. "916387400721@s.whatsapp.net" or "134544296509456@lid"
-	SenderPN    string `json:"sender_pn"` // resolved phone-number JID when sender used @lid privacy mode (e.g. "917696794756@s.whatsapp.net"); empty when not needed or not yet cached
-	PushName    string `json:"push_name"`
-	Body        string `json:"body"`
-	MessageID   string `json:"message_id"`
-	Timestamp   int64  `json:"timestamp"` // Unix epoch seconds
-	IsFromMe    bool   `json:"is_from_me"`
-	IsGroup     bool   `json:"is_group"`
-	MessageType string `json:"message_type"`
-	MediaURL    string `json:"media_url"`
-	MimeType    string `json:"mime_type"`
+	ChatID      string        `json:"chat_id"`
+	From        string        `json:"from"`      // sender's full JID e.g. "916387400721@s.whatsapp.net" or "134544296509456@lid"
+	SenderPN    string        `json:"sender_pn"` // resolved phone-number JID when sender used @lid privacy mode (e.g. "917696794756@s.whatsapp.net"); empty when not needed or not yet cached
+	PushName    string        `json:"push_name"`
+	Body        string        `json:"body"`
+	MessageID   string        `json:"message_id"`
+	Timestamp   int64         `json:"timestamp"` // Unix epoch seconds
+	IsFromMe    bool          `json:"is_from_me"`
+	IsGroup     bool          `json:"is_group"`
+	MessageType string        `json:"message_type"`
+	MediaURL    string        `json:"media_url"`
+	MimeType    string        `json:"mime_type"`
+	Referral    *ReferralInfo `json:"referral,omitempty"` // CTWA ad referral (first ad-sourced message only)
 }
 
 // Event is the top-level envelope sent to FastAPI.
